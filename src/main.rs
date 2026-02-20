@@ -456,8 +456,18 @@ fn main() -> Result<()> {
         GitSizeError::Validation(format!("Cannot open repository at {:?}: {}", repo_path, e))
     })?;
 
-    println!("Analyzing repository: {}", repo_path.display());
+    // Progress bar for analysis phase
+    let analysis_pb = ProgressBar::new(4);
+    analysis_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] {wide_msg}")
+            .unwrap(),
+    );
+    analysis_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
+    analysis_pb.set_message("Opening repository...");
+    
+    analysis_pb.set_message("Reading commit history...");
     // Get commit range
     let range = get_commit_range(&repo)?;
 
@@ -473,26 +483,26 @@ fn main() -> Result<()> {
     let duration = last_dt - first_dt;
     let years = duration.num_days() as f64 / 365.25;
 
-    println!(
-        "Repository spans {} to {} ({:.1} years, {} commits)",
-        first_dt.format("%Y-%m-%d"),
-        last_dt.format("%Y-%m-%d"),
-        years,
-        range.total_commits
-    );
+    analysis_pb.inc(1);
+    analysis_pb.set_message(format!("Found {} commits ({} to {}, {:.1} years)", 
+                                    range.total_commits, 
+                                    first_dt.format("%Y-%m-%d"),
+                                    last_dt.format("%Y-%m-%d"),
+                                    years));
 
     // Determine sampling strategy
     let use_yearly = args.yearly || (!args.monthly && years > 6.0);
-    println!(
-        "Using {} sampling",
-        if use_yearly { "yearly" } else { "monthly" }
-    );
+    analysis_pb.inc(1);
+    analysis_pb.set_message(format!("Using {} sampling", if use_yearly { "yearly" } else { "monthly" }));
 
     // Generate sample points
     let samples = generate_sample_points(&range, args.monthly, args.yearly)?;
-    println!("Will sample {} points", samples.len());
+    analysis_pb.inc(1);
+    analysis_pb.set_message(format!("Generated {} sample points", samples.len()));
 
-    // Progress bar
+    analysis_pb.finish_with_message("Analysis complete");
+
+    // Progress bar for sampling phase
     let pb = ProgressBar::new(samples.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
