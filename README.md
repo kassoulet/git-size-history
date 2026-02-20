@@ -1,19 +1,19 @@
 # Git Size History
 
-[![CI](https://github.com/example/git-size-history/actions/workflows/ci.yml/badge.svg)](https://github.com/example/git-size-history/actions/workflows/ci.yml)
+[![CI](https://github.com/kassoulet/git-size-history/actions/workflows/ci.yml/badge.svg)](https://github.com/kassoulet/git-size-history/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Crates.io](https://img.shields.io/crates/v/git-size-history.svg)](https://crates.io/crates/git-size-history)
-[![Rust](https://img.shields.io/badge/rust-1.75+-blue.svg)](https://github.com/example/git-size-history)
+[![Rust](https://img.shields.io/badge/rust-1.75+-blue.svg)](https://github.com/kassoulet/git-size-history)
 
 **Git Size History** is a fast CLI tool that analyzes how a git repository's size has grown over time by sampling commits at regular intervals and measuring packed object sizes.
 
 ## Features
 
-- ⚡ **Fast**: Uses `git rev-list --disk-usage` for efficient size measurement
-- 📊 **Visual**: Generates PNG plots of size over time
-- 📈 **Insightful**: Optional uncompressed size calculation shows compression efficiency
-- 🛡️ **Safe**: Read-only operations, never modifies your repository
-- 🖥️ **Cross-platform**: Works on Linux, macOS, and Windows
+- **Fast**: Efficient size measurement
+- **Visual**: Generates PNG plots of size over time
+- **Safe**: Read-only operations, never modifies your repository
+- **Cross-platform**: Works on Linux, macOS, and Windows
+
+![](linux.png)
 
 ## Installation
 
@@ -26,12 +26,6 @@ cargo build --release
 ```
 
 The binary will be at `target/release/git-size-history`.
-
-### From Crates.io (coming soon)
-
-```bash
-cargo install git-size-history
-```
 
 ## Quick Start
 
