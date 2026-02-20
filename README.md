@@ -13,6 +13,19 @@
 - **Safe**: Read-only operations, never modifies your repository
 - **Cross-platform**: Works on Linux, macOS, and Windows
 
+```
+$ time target/release/git-size-fast ~/tmp/linux -o linux.csv --plot linux.png
+  Repository spans 2005-04-16 to 2026-02-17 (20.8 years, 1425993 commits)
+  [00:00:58] Analysis
+  [00:14:34] [========================================] 22/22 Sampling
+Writing CSV to linux.csv
+Generating plot: linux.png
+
+real	15m33.510s
+```
+
+Scanning the size of nearly 1.5M commits in 15 minutes!
+
 ![](linux.png)
 
 ## Installation

@@ -8,29 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Initial release
-- Yearly/monthly sampling based on repository age
-- CSV output with date and cumulative size
-- PNG plot generation
-- Progress bar for long-running analyses
-- Efficient blob size measurement using `git rev-list --objects` and `git cat-file`
+- Comprehensive documentation for public functions
+- Unit and integration tests for core logic
+- Constants for magic numbers in sampling strategy
 
 ### Changed
-- Replaced shallow clone approach with direct object enumeration (much faster)
-- Use `git gc` instead of `git gc --aggressive` for better performance
-- No temporary repository clones needed
-
-### Deprecated
-- N/A
-
-### Removed
-- N/A
+- Refactored `measure_size_at_commit` to remove `awk` dependency and use pure Rust pipe processing
+- Improved progress bar accuracy and messages during analysis
+- Replaced `unwrap()` calls with proper error handling in `get_commit_range`
 
 ### Fixed
-- N/A
+- Fixed shell injection vulnerability in git command execution
 
 ### Security
-- N/A
+- Eliminated shell injection risk by avoiding `bash -c` and using direct argument passing for `Command`
 
 ## [0.1.0] - 2024-02-19
 

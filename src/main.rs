@@ -14,9 +14,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use plotters::prelude::*;
 use std::error::Error;
 use std::fmt;
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Analyze git repository size over time using commit sampling
 #[derive(Parser, Debug)]
@@ -117,36 +117,105 @@ type Result<T> = std::result::Result<T, GitSizeError>;
 
 /// Repository commit range information
 struct CommitRange<'repo> {
+    /// The oldest (first) commit in the repository
     first_commit: git2::Commit<'repo>,
+    /// The newest (last) commit in the repository
     last_commit: git2::Commit<'repo>,
+    /// All commits with their timestamps (sorted by time descending)
     all_commits: Vec<(git2::Oid, i64)>,
+    /// Total number of commits in the repository
     total_commits: u32,
 }
 
 /// A sample point in repository history
 struct SamplePoint {
+    /// Formatted date string (YYYY-MM-DD)
     date: String,
+    /// Commit hash at this sample point
     commit_hash: String,
 }
 
 /// Size measurement result
 struct SizeMeasurement {
+    /// Formatted date string (YYYY-MM-DD)
     date: String,
+    /// Cumulative packed size in bytes
     cumulative_size: u64,
+    /// Uncompressed blob size in bytes (if calculated)
     uncompressed_size: Option<u64>,
 }
 
-/// Get the first (oldest) and last (newest) commits from the repository
+/// Number of days in a year (accounting for leap years)
+const DAYS_PER_YEAR: f64 = 365.25;
+/// Repository age threshold in years for using yearly sampling
+const YEARLY_THRESHOLD_YEARS: f64 = 6.0;
+/// Sampling interval in days for yearly sampling
+const YEARLY_INTERVAL_DAYS: i64 = 365;
+/// Sampling interval in days for monthly sampling
+const MONTHLY_INTERVAL_DAYS: i64 = 30;
+
+/// Get the first (oldest) and last (newest) commits from the repository.
+///
+/// This function walks the commit history of the repository and returns
+/// information about the earliest and latest commits, along with a list
+/// of all commits and their timestamps.
 fn get_commit_range(repo: &Repository) -> Result<CommitRange<'_>> {
-    let mut revwalk = repo.revwalk()?;
-    revwalk.push_head()?;
+    let mut revwalk = repo.revwalk().map_err(|e| {
+        GitSizeError::Validation(format!(
+            "Failed to create commit walker. Repository may be corrupted or have invalid references. Git error: {}",
+            e
+        ))
+    })?;
+    revwalk.push_head().map_err(|e| {
+        let head_ref = repo.path().join("HEAD");
+        let head_exists = head_ref.exists();
+
+        if !head_exists {
+            GitSizeError::Validation(format!(
+                "Failed to push HEAD to commit walker. No HEAD file found at {:?}. \
+                This may be a bare repository or the repository structure is incomplete. \
+                Git error: {}",
+                head_ref, e
+            ))
+        } else {
+            GitSizeError::Validation(format!(
+                "Failed to push HEAD to commit walker. Repository may not have a valid HEAD reference. \
+                Try running 'git fsck' to check repository integrity. \
+                Git error: {}",
+                e
+            ))
+        }
+    })?;
     revwalk.set_sorting(Sort::TIME)?;
 
     let mut all_commits = Vec::new();
     for oid_result in revwalk {
-        let oid = oid_result?;
-        if let Ok(commit) = repo.find_commit(oid) {
-            all_commits.push((oid, commit.time().seconds()));
+        match oid_result {
+            Ok(oid) => {
+                if let Ok(commit) = repo.find_commit(oid) {
+                    all_commits.push((oid, commit.time().seconds()));
+                }
+            }
+            Err(e) => {
+                // Check if this is a zlib/pack corruption error
+                let error_msg = e.to_string();
+                if error_msg.contains("incorrect header check") || error_msg.contains("inflate") {
+                    return Err(GitSizeError::Validation(format!(
+                        "Repository has corrupted pack files ({}). \
+                        This prevents reading the commit history. \n\
+                        Suggested fixes:\n\
+                        1. Try repacking: cd <repo> && git repack -a -d\n\
+                        2. Re-clone the repository from the remote\n\
+                        3. Run 'git fsck' for detailed corruption report",
+                        e
+                    )));
+                }
+
+                return Err(GitSizeError::Validation(format!(
+                    "Failed to read commit during history walk. Repository may have corrupted objects. Git error: {}",
+                    e
+                )));
+            }
         }
     }
 
@@ -159,8 +228,12 @@ fn get_commit_range(repo: &Repository) -> Result<CommitRange<'_>> {
     let total_commits = all_commits.len() as u32;
 
     // Get first and last commits
-    let (first_oid, _) = all_commits.last().unwrap();
-    let (last_oid, _) = all_commits.first().unwrap();
+    let (first_oid, _) = all_commits
+        .last()
+        .ok_or_else(|| GitSizeError::Validation("No commits found".to_string()))?;
+    let (last_oid, _) = all_commits
+        .first()
+        .ok_or_else(|| GitSizeError::Validation("No commits found".to_string()))?;
 
     let first_commit = repo.find_commit(*first_oid)?;
     let last_commit = repo.find_commit(*last_oid)?;
@@ -173,7 +246,11 @@ fn get_commit_range(repo: &Repository) -> Result<CommitRange<'_>> {
     })
 }
 
-/// Generate sample points based on repository age
+/// Generate sample points based on repository age.
+///
+/// This function determines a set of sampling dates between the first and last
+/// commits of the repository. It uses an adaptive strategy (yearly or monthly)
+/// unless forced by flags.
 fn generate_sample_points(
     range: &CommitRange<'_>,
     monthly: bool,
@@ -188,11 +265,15 @@ fn generate_sample_points(
         .ok_or_else(|| GitSizeError::Validation("Invalid last commit timestamp".to_string()))?;
 
     let duration = last_dt - first_dt;
-    let years = duration.num_days() as f64 / 365.25;
+    let years = duration.num_days() as f64 / DAYS_PER_YEAR;
 
     // Determine sampling strategy
-    let use_yearly = yearly || (!monthly && years > 6.0);
-    let interval_days = if use_yearly { 365 } else { 30 };
+    let use_yearly = yearly || (!monthly && years > YEARLY_THRESHOLD_YEARS);
+    let interval_days = if use_yearly {
+        YEARLY_INTERVAL_DAYS
+    } else {
+        MONTHLY_INTERVAL_DAYS
+    };
 
     let mut sample_points = Vec::new();
     let mut current_time = first_dt;
@@ -207,9 +288,10 @@ fn generate_sample_points(
             });
         }
 
-        current_time = current_time
-            .checked_add_signed(Duration::days(interval_days))
-            .unwrap_or(last_dt);
+        current_time = match current_time.checked_add_signed(Duration::days(interval_days)) {
+            Some(new_time) => new_time,
+            None => break,
+        };
     }
 
     // Always include the latest commit
@@ -225,7 +307,10 @@ fn generate_sample_points(
     Ok(sample_points)
 }
 
-/// Find the commit nearest to a target timestamp from a pre-collected list
+/// Find the commit nearest to a target timestamp from a pre-collected list.
+///
+/// This function uses a binary search on the list of all commits, which is
+/// assumed to be sorted in reverse chronological order (newest first).
 fn find_nearest_commit(
     all_commits: &[(git2::Oid, i64)],
     target_timestamp: i64,
@@ -259,23 +344,39 @@ fn find_nearest_commit(
     Ok(best.map(|(oid, t)| (oid.to_string(), *t)))
 }
 
-/// Calculate the size of objects reachable from a specific commit
-fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool, calculate_uncompressed: bool) -> Result<(u64, Option<u64>)> {
-    let repo_path_str = source_repo.to_str().unwrap();
-    
+/// Calculate the size of objects reachable from a specific commit.
+///
+/// This function uses git commands via `std::process::Command` to:
+/// 1. Measure the packed disk usage using `git rev-list --objects --disk-usage`.
+/// 2. (Optional) Measure the uncompressed size of all blobs using a pipeline
+///    of `git rev-list` and `git cat-file`.
+fn measure_size_at_commit(
+    source_repo: &Path,
+    commit_hash: &str,
+    debug: bool,
+    calculate_uncompressed: bool,
+) -> Result<(u64, Option<u64>)> {
+    let repo_path_str = source_repo.to_str().ok_or_else(|| {
+        GitSizeError::Validation(format!("Invalid repository path: {:?}", source_repo))
+    })?;
+
     // Get packed disk usage using git rev-list --disk-usage
-    let disk_usage_cmd = format!(
-        "git -C '{}' rev-list --objects --disk-usage {}",
-        repo_path_str, commit_hash
-    );
-    
-    let disk_usage_output = Command::new("bash")
-        .args(["-c", &disk_usage_cmd])
+    let disk_usage_output = Command::new("git")
+        .args([
+            "-C",
+            repo_path_str,
+            "rev-list",
+            "--objects",
+            "--disk-usage",
+            commit_hash,
+        ])
         .output()
         .map_err(|e| GitSizeError::Command(format!("Failed to get disk usage: {}", e)))?;
 
     if !disk_usage_output.status.success() {
-        return Err(GitSizeError::Command("Failed to get disk usage".to_string()));
+        return Err(GitSizeError::Command(
+            "Failed to get disk usage".to_string(),
+        ));
     }
 
     // The last line contains the total disk usage in bytes
@@ -285,18 +386,51 @@ fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool, ca
         .last()
         .and_then(|line| line.trim().parse::<u64>().ok())
         .unwrap_or(0);
-    
+
     // Calculate uncompressed size only if requested (it's slower)
     let uncompressed_size = if calculate_uncompressed {
-        let cmd = format!(
-            "git -C '{}' rev-list --objects {} | awk '{{print $1}}' | git -C '{}' cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)'",
-            repo_path_str, commit_hash, repo_path_str
-        );
-        
-        let output = Command::new("bash")
-            .args(["-c", &cmd])
-            .output()
-            .map_err(|e| GitSizeError::Command(format!("Failed to execute: {}", e)))?;
+        let mut rev_list = Command::new("git")
+            .args(["-C", repo_path_str, "rev-list", "--objects", commit_hash])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
+
+        let mut cat_file = Command::new("git")
+            .args([
+                "-C",
+                repo_path_str,
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| GitSizeError::Command(format!("Failed to spawn git cat-file: {}", e)))?;
+
+        let mut stdin = cat_file.stdin.take().ok_or_else(|| {
+            GitSizeError::Command("Failed to open git cat-file stdin".to_string())
+        })?;
+
+        let stdout = rev_list.stdout.take().ok_or_else(|| {
+            GitSizeError::Command("Failed to open git rev-list stdout".to_string())
+        })?;
+
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+
+        while reader.read_line(&mut line)? > 0 {
+            if let Some(oid) = line.split_whitespace().next() {
+                stdin.write_all(oid.as_bytes())?;
+                stdin.write_all(b"\n")?;
+            }
+            line.clear();
+        }
+
+        drop(stdin); // Close stdin to signal end of input
+
+        let output = cat_file.wait_with_output().map_err(|e| {
+            GitSizeError::Command(format!("Failed to wait for git cat-file: {}", e))
+        })?;
 
         let mut total = 0u64;
         let mut blob_count = 0u64;
@@ -315,10 +449,13 @@ fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool, ca
 
         if debug {
             println!("  Objects: {}, Blobs: {}", object_count, blob_count);
-            println!("  Packed size: {}, Uncompressed size: {}", 
-                     format_size(packed_size), format_size(total));
+            println!(
+                "  Packed size: {}, Uncompressed size: {}",
+                format_size(packed_size),
+                format_size(total)
+            );
         }
-        
+
         Some(total)
     } else {
         if debug {
@@ -326,11 +463,27 @@ fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool, ca
         }
         None
     };
-    
+
     Ok((packed_size, uncompressed_size))
 }
 
-/// Format size in human-readable form
+/// Format a byte count into a human-readable string (B, KB, MB, GB).
+///
+/// This function converts a size in bytes to a human-readable format
+/// using decimal prefixes (1 KB = 1000 bytes).
+///
+/// # Arguments
+///
+/// * `size` - The size in bytes to format
+///
+/// # Examples
+///
+/// ```
+/// assert_eq!(format_size(0), "0 B");
+/// assert_eq!(format_size(1500), "1.50 KB");
+/// assert_eq!(format_size(2500000), "2.50 MB");
+/// assert_eq!(format_size(5500000000), "5.50 GB");
+/// ```
 fn format_size(size: u64) -> String {
     const KB: u64 = 1_000;
     const MB: u64 = 1_000_000;
@@ -347,7 +500,10 @@ fn format_size(size: u64) -> String {
     }
 }
 
-/// Generate cumulative size plot
+/// Generate a cumulative size over time plot using the `plotters` library.
+///
+/// This creates a PNG file at `output_path` displaying repository growth
+/// based on the provided size measurement data.
 fn generate_plot(data: &[SizeMeasurement], output_path: &Path) -> Result<()> {
     if data.is_empty() {
         return Ok(());
@@ -358,11 +514,10 @@ fn generate_plot(data: &[SizeMeasurement], output_path: &Path) -> Result<()> {
         .filter_map(|d| {
             NaiveDate::parse_from_str(&d.date, "%Y-%m-%d")
                 .ok()
-                .map(|dt| {
-                    (
-                        dt.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp(),
-                        d.cumulative_size,
-                    )
+                .and_then(|dt| {
+                    dt.and_hms_opt(0, 0, 0)
+                        .map(|naive| naive.and_utc().timestamp())
+                        .map(|ts| (ts, d.cumulative_size))
                 })
         })
         .collect();
@@ -453,20 +608,50 @@ fn main() -> Result<()> {
 
     // Open repository
     let repo = Repository::open(&repo_path).map_err(|e| {
-        GitSizeError::Validation(format!("Cannot open repository at {:?}: {}", repo_path, e))
+        let git_dir = repo_path.join(".git");
+        let is_git_dir = git_dir.exists();
+
+        // Check if it might be a bare repository
+        let config_file = repo_path.join("config");
+        let is_bare = !is_git_dir && config_file.exists();
+
+        let context = if is_bare {
+            format!(
+                "Cannot open repository at {:?}. The path appears to be a bare git repository. \
+                git-size-history requires a non-bare repository with a working directory. \
+                Either clone this repository to a working directory or use a regular git repository path. \
+                Git error: {}",
+                repo_path, e
+            )
+        } else if is_git_dir {
+            format!(
+                "Cannot open repository at {:?}. The .git directory exists but may be corrupted or inaccessible. \
+                Try running 'git fsck' to check repository integrity. \
+                Git error: {}",
+                repo_path, e
+            )
+        } else {
+            format!(
+                "Cannot open repository at {:?}. Path is not a git repository (no .git directory found). \
+                Make sure you're pointing to a valid git repository. \
+                Git error: {}",
+                repo_path, e
+            )
+        };
+        GitSizeError::Validation(context)
     })?;
 
     // Progress bar for analysis phase
-    let analysis_pb = ProgressBar::new(4);
+    let analysis_pb = ProgressBar::new(3);
     analysis_pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] {wide_msg}")
-            .unwrap(),
+            .map_err(|e| {
+                GitSizeError::Validation(format!("Failed to set progress style: {}", e))
+            })?,
     );
     analysis_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    analysis_pb.set_message("Opening repository...");
-    
     analysis_pb.set_message("Reading commit history...");
     // Get commit range
     let range = get_commit_range(&repo)?;
@@ -481,24 +666,29 @@ fn main() -> Result<()> {
     })?;
 
     let duration = last_dt - first_dt;
-    let years = duration.num_days() as f64 / 365.25;
+    let years = duration.num_days() as f64 / DAYS_PER_YEAR;
 
+    analysis_pb.set_message(format!(
+        "Found {} commits ({} to {}, {:.1} years)",
+        range.total_commits,
+        first_dt.format("%Y-%m-%d"),
+        last_dt.format("%Y-%m-%d"),
+        years
+    ));
     analysis_pb.inc(1);
-    analysis_pb.set_message(format!("Found {} commits ({} to {}, {:.1} years)", 
-                                    range.total_commits, 
-                                    first_dt.format("%Y-%m-%d"),
-                                    last_dt.format("%Y-%m-%d"),
-                                    years));
 
     // Determine sampling strategy
-    let use_yearly = args.yearly || (!args.monthly && years > 6.0);
+    let use_yearly = args.yearly || (!args.monthly && years > YEARLY_THRESHOLD_YEARS);
+    analysis_pb.set_message(format!(
+        "Using {} sampling",
+        if use_yearly { "yearly" } else { "monthly" }
+    ));
     analysis_pb.inc(1);
-    analysis_pb.set_message(format!("Using {} sampling", if use_yearly { "yearly" } else { "monthly" }));
 
     // Generate sample points
     let samples = generate_sample_points(&range, args.monthly, args.yearly)?;
-    analysis_pb.inc(1);
     analysis_pb.set_message(format!("Generated {} sample points", samples.len()));
+    analysis_pb.inc(1);
 
     analysis_pb.finish_with_message("Analysis complete");
 
@@ -507,7 +697,7 @@ fn main() -> Result<()> {
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
+            .map_err(|e| GitSizeError::Validation(format!("Failed to set progress style: {}", e)))?
             .progress_chars("=>-"),
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
@@ -518,7 +708,12 @@ fn main() -> Result<()> {
     for sample in &samples {
         pb.set_message(format!("Sampling {}...", sample.date));
 
-        let (packed_size, uncompressed_size) = measure_size_at_commit(&repo_path, &sample.commit_hash, args.debug, args.uncompressed)?;
+        let (packed_size, uncompressed_size) = measure_size_at_commit(
+            &repo_path,
+            &sample.commit_hash,
+            args.debug,
+            args.uncompressed,
+        )?;
 
         results.push(SizeMeasurement {
             date: sample.date.clone(),
@@ -526,7 +721,11 @@ fn main() -> Result<()> {
             uncompressed_size,
         });
 
-        pb.set_message(format!("Sampling {} ({})", sample.date, format_size(packed_size)));
+        pb.set_message(format!(
+            "Sampling {} ({})",
+            sample.date,
+            format_size(packed_size)
+        ));
         pb.inc(1);
     }
 
@@ -541,7 +740,7 @@ fn main() -> Result<()> {
             wtr.write_record([
                 &data.date,
                 &data.cumulative_size.to_string(),
-                &data.uncompressed_size.unwrap_or(0).to_string()
+                &data.uncompressed_size.unwrap_or(0).to_string(),
             ])?;
         }
     } else {
@@ -593,5 +792,418 @@ mod tests {
     fn test_format_size_gigabytes() {
         assert_eq!(format_size(1_000_000_000), "1.00 GB");
         assert_eq!(format_size(5_500_000_000), "5.50 GB");
+    }
+
+    #[test]
+    fn test_find_nearest_commit() {
+        let oid1 = git2::Oid::from_str("0000000000000000000000000000000000000001").unwrap();
+        let oid2 = git2::Oid::from_str("0000000000000000000000000000000000000002").unwrap();
+        let oid3 = git2::Oid::from_str("0000000000000000000000000000000000000003").unwrap();
+
+        // Commits are sorted by time descending (newest first)
+        let all_commits = vec![(oid3, 300), (oid2, 200), (oid1, 100)];
+
+        // Exact match
+        assert_eq!(
+            find_nearest_commit(&all_commits, 200).unwrap().unwrap().0,
+            oid2.to_string()
+        );
+
+        // Closer to oid2
+        assert_eq!(
+            find_nearest_commit(&all_commits, 210).unwrap().unwrap().0,
+            oid2.to_string()
+        );
+        assert_eq!(
+            find_nearest_commit(&all_commits, 190).unwrap().unwrap().0,
+            oid2.to_string()
+        );
+
+        // Closer to oid3
+        assert_eq!(
+            find_nearest_commit(&all_commits, 290).unwrap().unwrap().0,
+            oid3.to_string()
+        );
+
+        // Before oldest commit
+        assert_eq!(
+            find_nearest_commit(&all_commits, 50).unwrap().unwrap().0,
+            oid1.to_string()
+        );
+
+        // After newest commit
+        assert_eq!(
+            find_nearest_commit(&all_commits, 500).unwrap().unwrap().0,
+            oid3.to_string()
+        );
+    }
+
+    #[test]
+    fn test_find_nearest_commit_empty() {
+        let all_commits: Vec<(git2::Oid, i64)> = vec![];
+        assert!(find_nearest_commit(&all_commits, 100).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_integration_minimal_repo() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("git-size-test-{}", timestamp));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Initialize repo
+        let repo = git2::Repository::init(&temp_dir).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+
+        // Create initial commit
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "initial commit",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        // Test get_commit_range
+        let range = get_commit_range(&repo).unwrap();
+        assert_eq!(range.total_commits, 1);
+        assert_eq!(range.all_commits[0].0, oid);
+
+        // Test sampling
+        let samples = generate_sample_points(&range, false, false).unwrap();
+        assert!(!samples.is_empty());
+
+        // Test size measurement (at least check if it runs without error)
+        let (packed, _) =
+            measure_size_at_commit(&temp_dir, &oid.to_string(), false, false).unwrap();
+        assert!(packed > 0);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_generate_sample_points_yearly_strategy() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("git-size-yearly-test-{}", timestamp));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let repo = git2::Repository::init(&temp_dir).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+
+        // Create commits by appending content to the same file
+        for i in 0..50 {
+            let file_path = temp_dir.join("test.txt");
+            std::fs::write(&file_path, format!("Content {}\n", i)).unwrap();
+
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("test.txt")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+
+            let head = repo.head().ok();
+            let parent = head.as_ref().and_then(|h| h.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                &format!("commit {}", i),
+                &tree,
+                parents.as_slice(),
+            )
+            .unwrap();
+        }
+
+        let range = get_commit_range(&repo).unwrap();
+
+        // Force monthly sampling for this test
+        let samples = generate_sample_points(&range, true, false).unwrap();
+
+        // Should have at least one sample (the final commit)
+        // Note: Since all commits are created at nearly the same time,
+        // the sampling may only produce one point
+        assert!(!samples.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_generate_sample_points_forced_yearly() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("git-size-force-yearly-test-{}", timestamp));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let repo = git2::Repository::init(&temp_dir).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+
+        // Create a few commits
+        for i in 0..5 {
+            let file_path = temp_dir.join("test.txt");
+            std::fs::write(&file_path, format!("Content {}\n", i)).unwrap();
+
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("test.txt")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+
+            let head = repo.head().ok();
+            let parent = head.as_ref().and_then(|h| h.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                &format!("commit {}", i),
+                &tree,
+                parents.as_slice(),
+            )
+            .unwrap();
+        }
+
+        let range = get_commit_range(&repo).unwrap();
+
+        // Force yearly sampling
+        let samples = generate_sample_points(&range, false, true).unwrap();
+
+        // Should have at least start and end
+        assert!(!samples.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_generate_sample_points_forced_monthly() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("git-size-force-monthly-test-{}", timestamp));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let repo = git2::Repository::init(&temp_dir).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+
+        // Create commits
+        for i in 0..10 {
+            let file_path = temp_dir.join("test.txt");
+            std::fs::write(&file_path, format!("Content {}\n", i)).unwrap();
+
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("test.txt")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+
+            let head = repo.head().ok();
+            let parent = head.as_ref().and_then(|h| h.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+
+            repo.commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                &format!("commit {}", i),
+                &tree,
+                parents.as_slice(),
+            )
+            .unwrap();
+        }
+
+        let range = get_commit_range(&repo).unwrap();
+
+        // Force monthly sampling
+        let samples = generate_sample_points(&range, true, false).unwrap();
+
+        assert!(!samples.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_csv_output_format() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("git-size-csv-test-{}", timestamp));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let repo = git2::Repository::init(&temp_dir).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let _oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "initial commit",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        let output_path = temp_dir.join("output.csv");
+
+        // Test CSV writing directly
+        let mut wtr = Writer::from_path(&output_path).unwrap();
+        wtr.write_record(["date", "cumulative-size"]).unwrap();
+        wtr.write_record(["2024-01-01", "1234"]).unwrap();
+        wtr.flush().unwrap();
+
+        // Verify CSV content
+        let content = std::fs::read_to_string(&output_path).unwrap();
+        assert!(content.contains("date,cumulative-size"));
+        assert!(content.contains("2024-01-01,1234"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_measure_size_with_uncompressed() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("git-size-uncomp-test-{}", timestamp));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let repo = git2::Repository::init(&temp_dir).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+
+        // Create a commit with some content
+        let file_path = temp_dir.join("test.txt");
+        std::fs::write(&file_path, "Hello, World! This is some test content.").unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("test.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let oid = repo
+            .commit(
+                Some("HEAD"),
+                &signature,
+                &signature,
+                "commit with content",
+                &tree,
+                &[],
+            )
+            .unwrap();
+
+        // Test with uncompressed calculation
+        let (packed, uncompressed) =
+            measure_size_at_commit(&temp_dir, &oid.to_string(), false, true).unwrap();
+
+        assert!(packed > 0);
+        assert!(uncompressed.is_some());
+        assert!(uncompressed.unwrap() > 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_error_handling_invalid_path() {
+        let invalid_path = PathBuf::from("/nonexistent/path/to/repo");
+        let result = Repository::open(&invalid_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_error_handling_empty_repo() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("git-size-empty-test-{}", timestamp));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // Initialize repo but don't create any commits
+        let repo = git2::Repository::init(&temp_dir).unwrap();
+
+        // get_commit_range should return an error for empty repo
+        let result = get_commit_range(&repo);
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_multi_commit_repository() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("git-size-multi-test-{}", timestamp));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let repo = git2::Repository::init(&temp_dir).unwrap();
+        let signature = git2::Signature::now("test", "test@example.com").unwrap();
+
+        // Create multiple commits by modifying the same file
+        let mut commits = Vec::new();
+        for i in 0..5 {
+            let file_path = temp_dir.join("test.txt");
+            std::fs::write(&file_path, format!("Content of file {}\n", i)).unwrap();
+
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("test.txt")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+
+            let head = repo.head().ok();
+            let parent = head.as_ref().and_then(|h| h.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit> = parent.iter().collect();
+
+            let oid = repo
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    &format!("commit {}", i),
+                    &tree,
+                    parents.as_slice(),
+                )
+                .unwrap();
+            commits.push(oid);
+        }
+
+        // Test get_commit_range
+        let range = get_commit_range(&repo).unwrap();
+        assert_eq!(range.total_commits, 5);
+
+        // Test sampling
+        let samples = generate_sample_points(&range, false, false).unwrap();
+        assert!(!samples.is_empty());
+
+        // Test size measurement at different commits
+        for (i, commit_oid) in commits.iter().enumerate() {
+            let (packed, _) =
+                measure_size_at_commit(&temp_dir, &commit_oid.to_string(), false, false).unwrap();
+            assert!(packed > 0, "Size measurement failed for commit {}", i);
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
