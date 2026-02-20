@@ -172,5 +172,5 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) for deta
 
 ## Acknowledgments
 
-- Inspired by various git repository analysis tools
+- Inspired by https://www.lullabot.com/articles/how-calculate-git-repository-growth-over-time
 - Built with [clap](https://github.com/clap-rs/clap), [git2](https://github.com/rust-lang/git2-rs), and [plotters](https://github.com/plotters-rs/plotters-rs)
