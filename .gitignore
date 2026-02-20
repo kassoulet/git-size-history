@@ -1,0 +1,37 @@
+# Build artifacts
+/target/
+**/target/
+
+# Cargo lock file (keep for binaries)
+# Cargo.lock
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test output
+*.csv
+*.png
+*.ods
+
+# Temporary files
+*.tmp
+*.bak
+
+# Debug files
+*.pdb
+
+# Coverage
+*.gcno
+*.gcda
+coverage/
+*.lcov
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
