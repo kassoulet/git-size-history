@@ -1,4 +1,4 @@
-//! git-size-fast - Fast git repository size-over-time analysis using commit sampling
+//! Git Size History - Fast git repository size-over-time analysis using commit sampling
 //!
 //! This tool creates size-over-time analysis of git repositories by:
 //! 1. Determining the repository time span from first to last commit
@@ -20,8 +20,8 @@ use std::process::Command;
 
 /// Analyze git repository size over time using commit sampling
 #[derive(Parser, Debug)]
-#[command(name = "git-size-fast")]
-#[command(author, version, about, long_about = None)]
+#[command(name = "git-size-history")]
+#[command(author = "Gautier Portet <gautier@soundconverter.org>", version, about, long_about = None)]
 struct Args {
     /// Path to the git repository
     #[arg(default_value = ".")]

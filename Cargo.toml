@@ -1,13 +1,13 @@
 [package]
-name = "git-size-fast"
+name = "git-size-history"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Git Size Fast Contributors"]
+authors = ["Gautier Portet <gautier@soundconverter.org>"]
 description = "Fast git repository size-over-time analysis using commit sampling"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/example/git-size-fast"
+repository = "https://github.com/example/git-size-history"
 keywords = ["git", "repository", "size", "analysis", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 
