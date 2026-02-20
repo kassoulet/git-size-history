@@ -1,8 +1,8 @@
-# git-size-fast
+# Git Size History
 
-[![CI](https://github.com/example/git-size-fast/actions/workflows/ci.yml/badge.svg)](https://github.com/example/git-size-fast/actions/workflows/ci.yml)
+[![CI](https://github.com/example/git-size-history/actions/workflows/ci.yml/badge.svg)](https://github.com/example/git-size-history/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Crates.io](https://img.shields.io/crates/v/git-size-fast.svg)](https://crates.io/crates/git-size-fast)
+[![Crates.io](https://img.shields.io/crates/v/git-size-history.svg)](https://crates.io/crates/git-size-history)
 
 Fast git repository size-over-time analysis using commit sampling.
 
@@ -23,17 +23,17 @@ Fast git repository size-over-time analysis using commit sampling.
 ### From Source
 
 ```bash
-git clone https://github.com/example/git-size-fast.git
-cd git-size-fast
+git clone https://github.com/example/git-size-history.git
+cd git-size-history
 cargo build --release
 ```
 
-The binary will be at `target/release/git-size-fast`.
+The binary will be at `target/release/git-size-history`.
 
 ### From Crates.io (coming soon)
 
 ```bash
-cargo install git-size-fast
+cargo install git-size-history
 ```
 
 ## Usage
@@ -42,13 +42,13 @@ cargo install git-size-fast
 
 ```bash
 # Analyze current directory
-git-size-fast -o output.csv
+git-size-history -o output.csv
 
 # Analyze specific repository
-git-size-fast /path/to/repo -o output.csv
+git-size-history /path/to/repo -o output.csv
 
 # Generate plot
-git-size-fast -o output.csv --plot size-over-time.png /path/to/repo
+git-size-history -o output.csv --plot size-over-time.png /path/to/repo
 ```
 
 ### Options
@@ -60,6 +60,8 @@ git-size-fast -o output.csv --plot size-over-time.png /path/to/repo
 | `--plot <FILE>` | Generate PNG plot of cumulative size |
 | `--monthly` | Force monthly sampling |
 | `--yearly` | Force yearly sampling |
+| `-D, --debug` | Enable debug output (show object counts and sizes) |
+| `-U, --uncompressed` | Also calculate uncompressed blob sizes (slower) |
 | `-h, --help` | Print help information |
 | `-V, --version` | Print version information |
 
@@ -67,30 +69,39 @@ git-size-fast -o output.csv --plot size-over-time.png /path/to/repo
 
 ```bash
 # Analyze a large repository with yearly sampling
-git-size-fast --yearly -o linux-size.csv --plot linux-size.png /path/to/linux
+git-size-history --yearly -o linux-size.csv --plot linux-size.png /path/to/linux
 
 # Analyze current project with monthly sampling
-git-size-fast --monthly -o project-size.csv .
+git-size-history --monthly -o project-size.csv .
 
 # Quick analysis with default settings
-git-size-fast -o output.csv /path/to/repo
+git-size-history -o output.csv /path/to/repo
+
+# Show debug information during analysis
+git-size-history -D -o output.csv /path/to/repo
+
+# Include uncompressed sizes for compression ratio analysis
+git-size-history -U -o output.csv /path/to/repo
 ```
 
 ## Output Format
 
 ### CSV
 
-The output CSV contains two columns:
+The output CSV contains size measurements over time:
 
 ```csv
-date,cumulative-size
-2020-01-15,1048576
-2021-01-15,2097152
-2022-01-15,4194304
+date,cumulative-size,uncompressed-size
+2020-01-15,1048576,10485760
+2021-01-15,2097152,20971520
+2022-01-15,4194304,41943040
 ```
 
 - `date`: Sampling date in YYYY-MM-DD format
-- `cumulative-size`: Repository size in bytes after `git gc`
+- `cumulative-size`: Packed repository size in bytes (after `git gc`)
+- `uncompressed-size`: Total uncompressed blob size in bytes (only with `-U` flag)
+
+The ratio between uncompressed and packed size shows the compression efficiency.
 
 ### Plot
 
@@ -111,16 +122,16 @@ The generated PNG plot shows:
 
 For each sample point:
 
-1. **List Objects**: `git rev-list --objects <commit>` enumerates all objects reachable from the commit
-2. **Get Sizes**: `git cat-file --batch-check` retrieves the size of each blob
-3. **Sum Blobs**: Only blob objects are counted (not trees or commits)
+1. **Packed Size**: Uses `git rev-list --objects --disk-usage` to get the actual disk space used by objects
+2. **Uncompressed Size** (optional): Uses `git cat-file --batch-check` to sum individual blob sizes
 
 ### Why This Approach?
 
-- **Accurate**: Measures actual cumulative blob size at each historical point
+- **Accurate**: Measures actual disk usage after git compression
 - **Fast**: No cloning or temporary repositories needed
 - **Safe**: Read-only operations, never modifies the repository
 - **Efficient**: Uses git's batch mode for high-performance object queries
+- **Insightful**: Optional uncompressed size shows compression efficiency
 
 ## Performance
 
@@ -172,5 +183,5 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) for deta
 
 ## Acknowledgments
 
-- Inspired by https://www.lullabot.com/articles/how-calculate-git-repository-growth-over-time
+- Inspired by https://www.lullabot.com/articles/how-calculate-git-repository-growth-over-time, thanks Andrew.
 - Built with [clap](https://github.com/clap-rs/clap), [git2](https://github.com/rust-lang/git2-rs), and [plotters](https://github.com/plotters-rs/plotters-rs)

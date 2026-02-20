@@ -477,7 +477,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-size-fast"
+name = "git-size-history"
 version = "0.1.0"
 dependencies = [
  "chrono",

@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Create GitHub Release
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: true
+          prerelease: false
+
+  # Build for all platforms
+  build-release:
+    name: Build Release
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: git-size-history-x86_64-linux
+            binary_name: git-size-history
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: git-size-history-aarch64-linux
+            binary_name: git-size-history
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: git-size-history-x86_64-macos
+            binary_name: git-size-history
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: git-size-history-aarch64-macos
+            binary_name: git-size-history
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: git-size-history-x86_64-windows
+            binary_name: git-size-history.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p release-artifacts
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "release-artifacts/"
+          else
+            cp "target/${{ matrix.target }}/release/${{ matrix.binary_name }}" "release-artifacts/"
+          fi
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./release-artifacts/${{ matrix.binary_name }}
+          asset_name: ${{ matrix.artifact_name }}${{ endsWith(matrix.artifact_name, 'windows') && '.exe' || '' }}
+          asset_content_type: application/octet-stream
+
+  # Publish to crates.io
+  publish-crates:
+    name: Publish to crates.io
+    needs: [create-release, build-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+  # Notify release completion
+  release-complete:
+    name: Release Complete
+    needs: [create-release, build-release, publish-crates]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release Summary
+        run: |
+          echo "## Release ${{ github.ref }} Complete! 🎉"
+          echo ""
+          echo "### What's included:"
+          echo "- Linux binaries (x86_64, aarch64)"
+          echo "- macOS binaries (x86_64, aarch64)"
+          echo "- Windows binary (x86_64)"
+          echo "- Published to crates.io"
+          echo ""
+          echo "Download binaries from the release page."
