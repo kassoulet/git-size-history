@@ -129,6 +129,7 @@ struct SamplePoint {
 struct SizeMeasurement {
     date: String,
     cumulative_size: u64,
+    uncompressed_size: u64,
 }
 
 /// Get the first (oldest) and last (newest) commits from the repository
@@ -255,11 +256,33 @@ fn find_nearest_commit(
 }
 
 /// Calculate the size of objects reachable from a specific commit
-fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool) -> Result<u64> {
+fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool) -> Result<(u64, u64)> {
     let repo_path_str = source_repo.to_str().unwrap();
     
-    // Use shell pipe: extract object IDs, then get their sizes
-    // awk '{print $1}' extracts just the object ID (rev-list includes paths for blobs)
+    // Get packed disk usage using git rev-list --disk-usage
+    let disk_usage_cmd = format!(
+        "git -C '{}' rev-list --objects --disk-usage {}",
+        repo_path_str, commit_hash
+    );
+    
+    let disk_usage_output = Command::new("bash")
+        .args(["-c", &disk_usage_cmd])
+        .output()
+        .map_err(|e| GitSizeError::Command(format!("Failed to get disk usage: {}", e)))?;
+
+    if !disk_usage_output.status.success() {
+        return Err(GitSizeError::Command("Failed to get disk usage".to_string()));
+    }
+
+    // The last line contains the total disk usage in bytes
+    let disk_usage_stdout = String::from_utf8_lossy(&disk_usage_output.stdout);
+    let packed_size = disk_usage_stdout
+        .lines()
+        .last()
+        .and_then(|line| line.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    
+    // Also calculate uncompressed size for comparison
     let cmd = format!(
         "git -C '{}' rev-list --objects {} | awk '{{print $1}}' | git -C '{}' cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)'",
         repo_path_str, commit_hash, repo_path_str
@@ -270,12 +293,7 @@ fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool) ->
         .output()
         .map_err(|e| GitSizeError::Command(format!("Failed to execute: {}", e)))?;
 
-    if !output.status.success() {
-        return Err(GitSizeError::Command("Failed to measure objects".to_string()));
-    }
-
-    // Parse output and sum blob sizes
-    let mut total_size = 0u64;
+    let mut uncompressed_size = 0u64;
     let mut blob_count = 0u64;
     let mut object_count = 0u64;
 
@@ -284,18 +302,19 @@ fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool) ->
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 3 && parts[1] == "blob" {
             if let Ok(size) = parts[2].parse::<u64>() {
-                total_size += size;
+                uncompressed_size += size;
                 blob_count += 1;
             }
         }
     }
 
     if debug {
-        println!("  rev-list: {} objects, found {} blobs, total size: {}", 
-                 object_count, blob_count, format_size(total_size));
+        println!("  Objects: {}, Blobs: {}", object_count, blob_count);
+        println!("  Packed size: {}, Uncompressed size: {}", 
+                 format_size(packed_size), format_size(uncompressed_size));
     }
-
-    Ok(total_size)
+    
+    Ok((packed_size, uncompressed_size))
 }
 
 /// Format size in human-readable form
@@ -476,14 +495,15 @@ fn main() -> Result<()> {
     for sample in &samples {
         pb.set_message(format!("Sampling {}...", sample.date));
 
-        let size = measure_size_at_commit(&repo_path, &sample.commit_hash, args.debug)?;
+        let (packed_size, uncompressed_size) = measure_size_at_commit(&repo_path, &sample.commit_hash, args.debug)?;
 
         results.push(SizeMeasurement {
             date: sample.date.clone(),
-            cumulative_size: size,
+            cumulative_size: packed_size,
+            uncompressed_size,
         });
 
-        pb.set_message(format!("Sampling {} ({})", sample.date, format_size(size)));
+        pb.set_message(format!("Sampling {} ({})", sample.date, format_size(packed_size)));
         pb.inc(1);
     }
 
@@ -492,9 +512,13 @@ fn main() -> Result<()> {
     // Write CSV
     println!("Writing CSV to {}", args.output.display());
     let mut wtr = Writer::from_path(&args.output)?;
-    wtr.write_record(["date", "cumulative-size"])?;
+    wtr.write_record(["date", "cumulative-size", "uncompressed-size"])?;
     for data in &results {
-        wtr.write_record([&data.date, &data.cumulative_size.to_string()])?;
+        wtr.write_record([
+            &data.date, 
+            &data.cumulative_size.to_string(),
+            &data.uncompressed_size.to_string()
+        ])?;
     }
     wtr.flush()?;
 
