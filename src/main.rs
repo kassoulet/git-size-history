@@ -12,6 +12,7 @@ use csv::Writer;
 use git2::{Repository, Sort};
 use indicatif::{ProgressBar, ProgressStyle};
 use plotters::prelude::*;
+use rayon::prelude::*;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
@@ -702,32 +703,33 @@ fn main() -> Result<()> {
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // Measure sizes
-    let mut results: Vec<SizeMeasurement> = Vec::with_capacity(samples.len());
+    // Measure sizes in parallel for better performance
+    // Using rayon to process multiple sample points concurrently
+    let results: Vec<SizeMeasurement> = samples
+        .par_iter()
+        .map(|sample| {
+            let (packed_size, uncompressed_size) = measure_size_at_commit(
+                &repo_path,
+                &sample.commit_hash,
+                args.debug,
+                args.uncompressed,
+            )
+            .unwrap(); // In parallel context, we panic on error
 
-    for sample in &samples {
-        pb.set_message(format!("Sampling {}...", sample.date));
+            pb.set_message(format!(
+                "Sampling {} ({})",
+                sample.date,
+                format_size(packed_size)
+            ));
+            pb.inc(1);
 
-        let (packed_size, uncompressed_size) = measure_size_at_commit(
-            &repo_path,
-            &sample.commit_hash,
-            args.debug,
-            args.uncompressed,
-        )?;
-
-        results.push(SizeMeasurement {
-            date: sample.date.clone(),
-            cumulative_size: packed_size,
-            uncompressed_size,
-        });
-
-        pb.set_message(format!(
-            "Sampling {} ({})",
-            sample.date,
-            format_size(packed_size)
-        ));
-        pb.inc(1);
-    }
+            SizeMeasurement {
+                date: sample.date.clone(),
+                cumulative_size: packed_size,
+                uncompressed_size,
+            }
+        })
+        .collect();
 
     pb.finish_with_message("Sampling complete");
 
