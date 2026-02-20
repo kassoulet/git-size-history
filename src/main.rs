@@ -14,7 +14,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use plotters::prelude::*;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -35,13 +35,17 @@ struct Args {
     #[arg(long)]
     plot: Option<PathBuf>,
 
+    /// Force yearly sampling
+    #[arg(long)]
+    yearly: bool,
+
     /// Force monthly sampling (default: yearly for repos > 6 years)
     #[arg(long)]
     monthly: bool,
 
-    /// Force yearly sampling
-    #[arg(long)]
-    yearly: bool,
+    /// Enable debug output (show command outputs)
+    #[arg(long, short = 'D')]
+    debug: bool,
 }
 
 #[derive(Debug)]
@@ -108,9 +112,10 @@ impl From<chrono::OutOfRangeError> for GitSizeError {
 type Result<T> = std::result::Result<T, GitSizeError>;
 
 /// Repository commit range information
-struct CommitRange {
-    first_commit: git2::Commit<'static>,
-    last_commit: git2::Commit<'static>,
+struct CommitRange<'repo> {
+    first_commit: git2::Commit<'repo>,
+    last_commit: git2::Commit<'repo>,
+    all_commits: Vec<(git2::Oid, i64)>,
     total_commits: u32,
 }
 
@@ -118,7 +123,6 @@ struct CommitRange {
 struct SamplePoint {
     date: String,
     commit_hash: String,
-    depth: u32,
 }
 
 /// Size measurement result
@@ -128,47 +132,45 @@ struct SizeMeasurement {
 }
 
 /// Get the first (oldest) and last (newest) commits from the repository
-fn get_commit_range(repo: &Repository) -> Result<CommitRange> {
+fn get_commit_range(repo: &Repository) -> Result<CommitRange<'_>> {
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
     revwalk.set_sorting(Sort::TIME)?;
 
-    let commits: Vec<git2::Oid> = revwalk.filter_map(|r| r.ok()).collect();
+    let mut all_commits = Vec::new();
+    for oid_result in revwalk {
+        let oid = oid_result?;
+        if let Ok(commit) = repo.find_commit(oid) {
+            all_commits.push((oid, commit.time().seconds()));
+        }
+    }
 
-    if commits.is_empty() {
+    if all_commits.is_empty() {
         return Err(GitSizeError::Validation(
             "No commits found in repository".to_string(),
         ));
     }
 
-    let total_commits = commits.len() as u32;
+    let total_commits = all_commits.len() as u32;
 
     // Get first and last commits
-    let first_oid = commits.last().unwrap();
-    let last_oid = commits.first().unwrap();
+    let (first_oid, _) = all_commits.last().unwrap();
+    let (last_oid, _) = all_commits.first().unwrap();
 
     let first_commit = repo.find_commit(*first_oid)?;
     let last_commit = repo.find_commit(*last_oid)?;
 
-    // Safety: We're extending the lifetime here, but the commits are tied to the repo
-    // which outlives this function. This is safe in this specific context.
-    let first_commit =
-        unsafe { std::mem::transmute::<git2::Commit<'_>, git2::Commit<'static>>(first_commit) };
-    let last_commit =
-        unsafe { std::mem::transmute::<git2::Commit<'_>, git2::Commit<'static>>(last_commit) };
-
     Ok(CommitRange {
         first_commit,
         last_commit,
+        all_commits,
         total_commits,
     })
 }
 
 /// Generate sample points based on repository age
 fn generate_sample_points(
-    repo: &Repository,
-    repo_path: &Path,
-    range: &CommitRange,
+    range: &CommitRange<'_>,
     monthly: bool,
     yearly: bool,
 ) -> Result<Vec<SamplePoint>> {
@@ -193,13 +195,10 @@ fn generate_sample_points(
     while current_time <= last_dt {
         let target_timestamp = current_time.timestamp();
 
-        if let Some(commit_info) = find_nearest_commit(repo, target_timestamp)? {
-            let depth = calculate_commit_depth(repo_path, &commit_info.0)?;
-
+        if let Some(commit_info) = find_nearest_commit(&range.all_commits, target_timestamp)? {
             sample_points.push(SamplePoint {
                 date: current_time.format("%Y-%m-%d").to_string(),
                 commit_hash: commit_info.0,
-                depth,
             });
         }
 
@@ -208,21 +207,11 @@ fn generate_sample_points(
             .unwrap_or(last_dt);
     }
 
-    // Always include the latest commit if not already present
-    let last_timestamp = range.last_commit.time().seconds();
-    if !sample_points.iter().any(|p| {
-        NaiveDate::parse_from_str(&p.date, "%Y-%m-%d")
-            .ok()
-            .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())
-            == Some(last_timestamp)
-    }) {
-        let depth = calculate_commit_depth(repo_path, &range.last_commit.id().to_string())?;
-        sample_points.push(SamplePoint {
-            date: last_dt.format("%Y-%m-%d").to_string(),
-            commit_hash: range.last_commit.id().to_string(),
-            depth,
-        });
-    }
+    // Always include the latest commit
+    sample_points.push(SamplePoint {
+        date: last_dt.format("%Y-%m-%d").to_string(),
+        commit_hash: range.last_commit.id().to_string(),
+    });
 
     // Remove duplicates and sort by date
     sample_points.sort_by(|a, b| a.date.cmp(&b.date));
@@ -231,119 +220,79 @@ fn generate_sample_points(
     Ok(sample_points)
 }
 
-/// Find the commit nearest to a target timestamp
-fn find_nearest_commit(repo: &Repository, target_timestamp: i64) -> Result<Option<(String, i64)>> {
-    let mut revwalk = repo.revwalk()?;
-    revwalk.push_head()?;
-    revwalk.set_sorting(Sort::TIME)?;
+/// Find the commit nearest to a target timestamp from a pre-collected list
+fn find_nearest_commit(
+    all_commits: &[(git2::Oid, i64)],
+    target_timestamp: i64,
+) -> Result<Option<(String, i64)>> {
+    if all_commits.is_empty() {
+        return Ok(None);
+    }
 
-    let mut best: Option<(String, i64)> = None;
-    let mut best_diff = i64::MAX;
-
-    for oid_result in revwalk {
-        let oid = oid_result?;
-        if let Ok(commit) = repo.find_commit(oid) {
-            let commit_time = commit.time().seconds();
-            let diff = (commit_time - target_timestamp).abs();
-
-            if diff < best_diff {
-                best_diff = diff;
-                best = Some((oid.to_string(), commit_time));
-            }
-
-            // Stop if we've gone past the target significantly
-            if commit_time < target_timestamp && best.is_some() {
-                break;
+    // Binary search to find the nearest commit
+    // Since all_commits is sorted by time DESCENDING (newest first)
+    let best = match all_commits.binary_search_by(|(_, t)| target_timestamp.cmp(t)) {
+        Ok(idx) => Some(&all_commits[idx]),
+        Err(idx) => {
+            if idx == 0 {
+                Some(&all_commits[0])
+            } else if idx == all_commits.len() {
+                Some(&all_commits[idx - 1])
+            } else {
+                // Check both neighbors
+                let t1 = all_commits[idx - 1].1;
+                let t2 = all_commits[idx].1;
+                if (t1 - target_timestamp).abs() < (t2 - target_timestamp).abs() {
+                    Some(&all_commits[idx - 1])
+                } else {
+                    Some(&all_commits[idx])
+                }
             }
         }
-    }
+    };
 
-    Ok(best)
-}
-
-/// Calculate commit depth using git rev-list
-fn calculate_commit_depth(repo_path: &Path, commit_hash: &str) -> Result<u32> {
-    let output = Command::new("git")
-        .args(["rev-list", "--count", commit_hash, "..HEAD"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| GitSizeError::Command(format!("Failed to run git rev-list: {}", e)))?;
-
-    if output.status.success() {
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u32>()
-            .map(|n| n + 1)
-            .map_err(|e| GitSizeError::Validation(format!("Invalid commit count: {}", e)))
-    } else {
-        Err(GitSizeError::Command(format!(
-            "git rev-list failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )))
-    }
+    Ok(best.map(|(oid, t)| (oid.to_string(), *t)))
 }
 
 /// Calculate the size of objects reachable from a specific commit
-fn measure_size_at_depth(source_repo: &Path, commit_hash: &str, _depth: u32) -> Result<u64> {
-    // Get all objects reachable from the commit
-    let objects_output = Command::new("git")
-        .args([
-            "-C",
-            source_repo.to_str().unwrap(),
-            "rev-list",
-            "--objects",
-            commit_hash,
-        ])
+fn measure_size_at_commit(source_repo: &Path, commit_hash: &str, debug: bool) -> Result<u64> {
+    let repo_path_str = source_repo.to_str().unwrap();
+    
+    // Use shell pipe: extract object IDs, then get their sizes
+    // awk '{print $1}' extracts just the object ID (rev-list includes paths for blobs)
+    let cmd = format!(
+        "git -C '{}' rev-list --objects {} | awk '{{print $1}}' | git -C '{}' cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)'",
+        repo_path_str, commit_hash, repo_path_str
+    );
+    
+    let output = Command::new("bash")
+        .args(["-c", &cmd])
         .output()
-        .map_err(|e| GitSizeError::Command(format!("Failed to list objects: {}", e)))?;
+        .map_err(|e| GitSizeError::Command(format!("Failed to execute: {}", e)))?;
 
-    if !objects_output.status.success() {
-        return Err(GitSizeError::Command("Failed to list objects".to_string()));
+    if !output.status.success() {
+        return Err(GitSizeError::Command("Failed to measure objects".to_string()));
     }
 
+    // Parse output and sum blob sizes
     let mut total_size = 0u64;
-
-    // For each object, get its size using git cat-file --batch-check
-    let objects_list = String::from_utf8_lossy(&objects_output.stdout);
-    let object_ids: Vec<&str> = objects_list
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .collect();
-
-    if object_ids.is_empty() {
-        return Ok(0);
-    }
-
-    // Use batch mode for efficiency
-    let mut cat_file = Command::new("git")
-        .args([
-            "-C",
-            source_repo.to_str().unwrap(),
-            "cat-file",
-            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| GitSizeError::Command(format!("Failed to start cat-file: {}", e)))?;
-
-    let stdin = cat_file.stdin.as_mut().unwrap();
-    for oid in &object_ids {
-        writeln!(stdin, "{}", oid).map_err(GitSizeError::Io)?;
-    }
-    drop(cat_file.stdin.take()); // Close stdin to signal end of input
-
-    let output = cat_file
-        .wait_with_output()
-        .map_err(|e| GitSizeError::Command(format!("cat-file failed: {}", e)))?;
+    let mut blob_count = 0u64;
+    let mut object_count = 0u64;
 
     for line in String::from_utf8_lossy(&output.stdout).lines() {
+        object_count += 1;
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 3 && parts[1] == "blob" {
             if let Ok(size) = parts[2].parse::<u64>() {
                 total_size += size;
+                blob_count += 1;
             }
         }
+    }
+
+    if debug {
+        println!("  rev-list: {} objects, found {} blobs, total size: {}", 
+                 object_count, blob_count, format_size(total_size));
     }
 
     Ok(total_size)
@@ -482,8 +431,12 @@ fn main() -> Result<()> {
 
     let first_ts = range.first_commit.time().seconds();
     let last_ts = range.last_commit.time().seconds();
-    let first_dt = DateTime::from_timestamp(first_ts, 0).unwrap();
-    let last_dt = DateTime::from_timestamp(last_ts, 0).unwrap();
+    let first_dt = DateTime::from_timestamp(first_ts, 0).ok_or_else(|| {
+        GitSizeError::Validation(format!("Invalid first commit timestamp: {}", first_ts))
+    })?;
+    let last_dt = DateTime::from_timestamp(last_ts, 0).ok_or_else(|| {
+        GitSizeError::Validation(format!("Invalid last commit timestamp: {}", last_ts))
+    })?;
 
     let duration = last_dt - first_dt;
     let years = duration.num_days() as f64 / 365.25;
@@ -504,7 +457,7 @@ fn main() -> Result<()> {
     );
 
     // Generate sample points
-    let samples = generate_sample_points(&repo, &repo_path, &range, args.monthly, args.yearly)?;
+    let samples = generate_sample_points(&range, args.monthly, args.yearly)?;
     println!("Will sample {} points", samples.len());
 
     // Progress bar
@@ -515,17 +468,15 @@ fn main() -> Result<()> {
             .unwrap()
             .progress_chars("=>-"),
     );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Measure sizes
     let mut results: Vec<SizeMeasurement> = Vec::with_capacity(samples.len());
 
     for sample in &samples {
-        pb.set_message(format!(
-            "Sampling {} (depth: {})...",
-            sample.date, sample.depth
-        ));
+        pb.set_message(format!("Sampling {}...", sample.date));
 
-        let size = measure_size_at_depth(&repo_path, &sample.commit_hash, sample.depth)?;
+        let size = measure_size_at_commit(&repo_path, &sample.commit_hash, args.debug)?;
 
         results.push(SizeMeasurement {
             date: sample.date.clone(),
