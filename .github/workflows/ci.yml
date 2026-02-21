@@ -126,27 +126,31 @@ jobs:
         run: cargo install cargo-audit
 
       - name: Run cargo audit
-        run: cargo audit || echo "Warning: cargo-audit found issues"
+        run: |
+          cargo audit || echo "Warning: cargo-audit found issues"
 
   # Build release artifacts
   release:
     name: Release Build
     runs-on: ${{ matrix.os }}
-    if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: git-size-history-linux
+            binary_name: git-size-history
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact_name: git-size-history-macos
+            binary_name: git-size-history
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: git-size-history-windows.exe
+            artifact_name: git-size-history-windows
+            binary_name: git-size-history.exe
     steps:
       - uses: actions/checkout@v4
+        if: startsWith(github.ref, 'refs/tags/v')
 
       - name: Install Rust
         uses: dtolnay/rust-action@stable
@@ -160,7 +164,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name == 'git-size-history-windows.exe' && 'git-size-history.exe' || 'git-size-history' }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary_name }}
 
   # Integration test with real git repo
   integration:
