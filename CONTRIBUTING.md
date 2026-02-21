@@ -1,6 +1,6 @@
-# Contributing to git-size-fast
+# Contributing to git-size-history
 
-Thank you for considering contributing to git-size-fast! This document provides guidelines and instructions for contributing.
+Thank you for considering contributing to git-size-history! This document provides guidelines and instructions for contributing.
 
 ## Code of Conduct
 
@@ -9,7 +9,7 @@ Please be respectful and constructive in all interactions.
 ## Getting Started
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/your-username/git-size-fast.git`
+2. Clone your fork: `git clone https://github.com/kassoulet/git-size-history.git`
 3. Create a branch: `git checkout -b feature/your-feature`
 4. Make your changes
 5. Run tests: `cargo test`

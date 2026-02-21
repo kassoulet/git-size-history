@@ -127,8 +127,6 @@ The generated PNG plot displays:
 - **Y-axis**: Repository size with automatic unit scaling (B, KB, MB, GB)
 - **Line**: Cumulative packed size over time
 
-![Example Plot](.github/plot-example.png)
-
 ## How It Works
 
 ### Sampling Strategy
@@ -158,24 +156,6 @@ For each sample point:
 | **Fast** | No cloning or temporary repositories needed |
 | **Safe** | Read-only operations, never modifies the repository |
 | **Efficient** | Uses git's batch mode for high-performance queries |
-| **Insightful** | Compression ratio reveals repository health |
-
-## Performance
-
-Typical performance characteristics:
-
-| Repository Size | Commits | Time |
-|-----------------|---------|------|
-| Small | <100 | <1 second |
-| Medium | 100-1,000 | 5-30 seconds |
-| Large | 1,000-10,000 | 1-5 minutes |
-| Very Large | >10,000 | 5-15 minutes |
-
-**Factors affecting performance:**
-- Number of sample points (yearly vs monthly)
-- Total commit count
-- Disk I/O speed
-- Object database size
 
 ## Requirements
 
@@ -183,10 +163,6 @@ Typical performance characteristics:
 |------------|---------|
 | Rust | 1.75 or later |
 | Git | 2.0 or later |
-
-### Optional Dependencies
-
-- `awk`: Used for efficient object ID extraction (pre-installed on most Unix systems)
 
 ## Troubleshooting
 
@@ -247,18 +223,6 @@ cargo fmt -- --check
 cargo clippy -- -D warnings
 ```
 
-## Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-### Areas for Contribution
-
-- 📝 Additional documentation
-- 🧪 More test coverage
-- 🐛 Bug fixes
-- ✨ New features (see [Issues](https://github.com/example/git-size-history/issues))
-- 🌍 Internationalization
-
 ## License
 
 This project is licensed under the MIT License - see [LICENSE](LICENSE) for details.
@@ -267,13 +231,16 @@ This project is licensed under the MIT License - see [LICENSE](LICENSE) for deta
 
 - Inspired by [How to Calculate Git Repository Growth Over Time](https://www.lullabot.com/articles/how-calculate-git-repository-growth-over-time) by Andrew Berry
 - Built with:
+  - [chrono](https://github.com/chronotope/chrono) - Date and time handling
   - [clap](https://github.com/clap-rs/clap) - Command-line argument parser
+  - [csv](https://github.com/BurntSushi/rust-csv) - CSV parsing and writing
   - [git2](https://github.com/rust-lang/git2-rs) - Git bindings for Rust
-  - [plotters](https://github.com/plotters-rs/plotters-rs) - Plotting library
   - [indicatif](https://github.com/console-rs/indicatif) - Progress bars
+  - [plotters](https://github.com/plotters-rs/plotters-rs) - Plotting library
+  - [rayon](https://github.com/rayon-rs/rayon) - Data parallelism library
 
 ## Related Projects
 
 - [git-annex](https://git-annex.branchable.com/) - File synchronization with git
 - [git-lfs](https://git-lfs.com/) - Git Large File Storage
-- [git-sizer](https://github.com/github/git-sizer) - Compute various size metrics for a git repository
+- [git-sizer](https://github.com/github/git-sizer) - Compute various size metrics for a git repository, and spot problematic usages
