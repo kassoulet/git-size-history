@@ -4,27 +4,41 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.75+-blue.svg)](https://github.com/kassoulet/git-size-history)
 
-**Git Size History** is a fast CLI tool that analyzes how a git repository's size has grown over time by sampling commits at regular intervals and measuring packed object sizes.
+**Git Size History** is an experimental fast CLI tool that analyzes how a git repository's size has grown over time by sampling commits at regular intervals and measuring packed object sizes.
 
 ## Features
 
-- **Fast**: Efficient size measurement
+- **Fast**: Efficient size measurement, multithreaded processing
 - **Visual**: Generates PNG plots of size over time
 - **Safe**: Read-only operations, never modifies your repository
 - **Cross-platform**: Works on Linux, macOS, and Windows
 
 ```
-$ time target/release/git-size-fast ~/tmp/linux -o linux.csv --plot linux.png
-  Repository spans 2005-04-16 to 2026-02-17 (20.8 years, 1425993 commits)
-  [00:00:58] Analysis
-  [00:14:34] [========================================] 22/22 Sampling
+  [00:00:35] Analysis complete
+  [00:02:27] [========================================] 22/22 Sampling complete
 Writing CSV to linux.csv
 Generating plot: linux.png
+Plot saved to linux.png
 
-real	15m33.510s
+=== Summary ===
+Repository: /home/gautier/tmp/linux
+Total commits analyzed: 1426552
+Time span: 2005-04-16 to 2026-02-21 (20.8 years)
+Sample points: 22
+Sampling method: yearly
+Initial size (2005-04-16): 53.15 MB
+Final size (2026-02-21): 6.21 GB
+Total growth: 6.16 GB
+
+Output written to linux.csv
+Plot saved to linux.png
+
+real	2m58,745s
+user	18m44,509s
+sys	0m19,285s
 ```
 
-Scanning the size of nearly 1.5M commits in 15 minutes!
+Scanning the size history of 1.4M commits in 3 minutes!
 
 ![](linux.png)
 

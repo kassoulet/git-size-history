@@ -160,7 +160,10 @@ const MONTHLY_INTERVAL_DAYS: i64 = 30;
 /// This function walks the commit history of the repository and returns
 /// information about the earliest and latest commits, along with a list
 /// of all commits and their timestamps.
-fn get_commit_range(repo: &Repository) -> Result<CommitRange<'_>> {
+fn get_commit_range<'a>(
+    repo: &'a Repository,
+    analysis_pb: &ProgressBar,
+) -> Result<CommitRange<'a>> {
     let mut revwalk = repo.revwalk().map_err(|e| {
         GitSizeError::Validation(format!(
             "Failed to create commit walker. Repository may be corrupted or have invalid references. Git error: {}",
@@ -195,6 +198,10 @@ fn get_commit_range(repo: &Repository) -> Result<CommitRange<'_>> {
             Ok(oid) => {
                 if let Ok(commit) = repo.find_commit(oid) {
                     all_commits.push((oid, commit.time().seconds()));
+                    analysis_pb.set_message(format!(
+                        "Reading commit history... {} commits",
+                        all_commits.len()
+                    ));
                 }
             }
             Err(e) => {
@@ -655,7 +662,8 @@ fn main() -> Result<()> {
 
     analysis_pb.set_message("Reading commit history...");
     // Get commit range
-    let range = get_commit_range(&repo)?;
+    let range = get_commit_range(&repo, &analysis_pb)?;
+    let total_commits = range.total_commits;
 
     let first_ts = range.first_commit.time().seconds();
     let last_ts = range.last_commit.time().seconds();
@@ -671,7 +679,7 @@ fn main() -> Result<()> {
 
     analysis_pb.set_message(format!(
         "Found {} commits ({} to {}, {:.1} years)",
-        range.total_commits,
+        total_commits,
         first_dt.format("%Y-%m-%d"),
         last_dt.format("%Y-%m-%d"),
         years
@@ -693,7 +701,7 @@ fn main() -> Result<()> {
 
     analysis_pb.finish_with_message("Analysis complete");
 
-    // Progress bar for sampling phase
+    // Progress bar for sampling phase - shows complete commits count
     let pb = ProgressBar::new(samples.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -760,7 +768,56 @@ fn main() -> Result<()> {
         println!("Plot saved to {}", plot_path.display());
     }
 
-    println!("Done! Output written to {}", args.output.display());
+    // Print summary
+    println!("\n=== Summary ===");
+    println!("Repository: {}", repo_path.display());
+    println!("Total commits analyzed: {}", range.total_commits);
+    println!(
+        "Time span: {} to {} ({:.1} years)",
+        first_dt.format("%Y-%m-%d"),
+        last_dt.format("%Y-%m-%d"),
+        years
+    );
+    println!("Sample points: {}", results.len());
+    println!(
+        "Sampling method: {}",
+        if use_yearly { "yearly" } else { "monthly" }
+    );
+
+    if let Some(first) = results.first() {
+        println!(
+            "Initial size ({}): {}",
+            first.date,
+            format_size(first.cumulative_size)
+        );
+    }
+    if let Some(last) = results.last() {
+        println!(
+            "Final size ({}): {}",
+            last.date,
+            format_size(last.cumulative_size)
+        );
+    }
+
+    if results.len() >= 2 {
+        if let (Some(first), Some(last)) = (results.first(), results.last()) {
+            let growth = last.cumulative_size.saturating_sub(first.cumulative_size);
+            println!("Total growth: {}", format_size(growth));
+        }
+    }
+
+    if args.uncompressed {
+        if let Some(last) = results.last() {
+            if let Some(uncompressed) = last.uncompressed_size {
+                println!("Final uncompressed size: {}", format_size(uncompressed));
+            }
+        }
+    }
+
+    println!("\nOutput written to {}", args.output.display());
+    if let Some(plot_path) = &args.plot {
+        println!("Plot saved to {}", plot_path.display());
+    }
 
     Ok(())
 }
