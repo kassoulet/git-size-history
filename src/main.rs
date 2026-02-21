@@ -931,7 +931,8 @@ mod tests {
             .unwrap();
 
         // Test get_commit_range
-        let range = get_commit_range(&repo).unwrap();
+        let pb = ProgressBar::hidden();
+        let range = get_commit_range(&repo, &pb).unwrap();
         assert_eq!(range.total_commits, 1);
         assert_eq!(range.all_commits[0].0, oid);
 
@@ -986,7 +987,8 @@ mod tests {
             .unwrap();
         }
 
-        let range = get_commit_range(&repo).unwrap();
+        let pb = ProgressBar::hidden();
+        let range = get_commit_range(&repo, &pb).unwrap();
 
         // Force monthly sampling for this test
         let samples = generate_sample_points(&range, true, false).unwrap();
@@ -1038,7 +1040,8 @@ mod tests {
             .unwrap();
         }
 
-        let range = get_commit_range(&repo).unwrap();
+        let pb = ProgressBar::hidden();
+        let range = get_commit_range(&repo, &pb).unwrap();
 
         // Force yearly sampling
         let samples = generate_sample_points(&range, false, true).unwrap();
@@ -1088,7 +1091,8 @@ mod tests {
             .unwrap();
         }
 
-        let range = get_commit_range(&repo).unwrap();
+        let pb = ProgressBar::hidden();
+        let range = get_commit_range(&repo, &pb).unwrap();
 
         // Force monthly sampling
         let samples = generate_sample_points(&range, true, false).unwrap();
@@ -1201,7 +1205,8 @@ mod tests {
         let repo = git2::Repository::init(&temp_dir).unwrap();
 
         // get_commit_range should return an error for empty repo
-        let result = get_commit_range(&repo);
+        let pb = ProgressBar::hidden();
+        let result = get_commit_range(&repo, &pb);
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1249,7 +1254,8 @@ mod tests {
         }
 
         // Test get_commit_range
-        let range = get_commit_range(&repo).unwrap();
+        let pb = ProgressBar::hidden();
+        let range = get_commit_range(&repo, &pb).unwrap();
         assert_eq!(range.total_commits, 5);
 
         // Test sampling
