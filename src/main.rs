@@ -198,10 +198,13 @@ fn get_commit_range<'a>(
             Ok(oid) => {
                 if let Ok(commit) = repo.find_commit(oid) {
                     all_commits.push((oid, commit.time().seconds()));
-                    analysis_pb.set_message(format!(
-                        "Reading commit history... {} commits",
-                        all_commits.len()
-                    ));
+                    // Throttle progress bar updates to reduce string formatting overhead
+                    if all_commits.len() % 1000 == 0 {
+                        analysis_pb.set_message(format!(
+                            "Reading commit history... {} commits",
+                            all_commits.len()
+                        ));
+                    }
                 }
             }
             Err(e) => {
@@ -234,6 +237,8 @@ fn get_commit_range<'a>(
     }
 
     let total_commits = all_commits.len() as u32;
+    // Shrink to fit to reduce memory usage for large repositories
+    all_commits.shrink_to_fit();
 
     // Get first and last commits
     let (first_oid, _) = all_commits
@@ -327,8 +332,12 @@ fn find_nearest_commit(
         return Ok(None);
     }
 
-    // Binary search to find the nearest commit
-    // Since all_commits is sorted by time DESCENDING (newest first)
+    // Binary search to find the nearest commit.
+    // Since all_commits is sorted by time DESCENDING (newest first),
+    // target_timestamp.cmp(t) is correct because it returns Ordering::Less
+    // for elements larger than target_timestamp (which are to the left)
+    // and Ordering::Greater for elements smaller (which are to the right).
+    // This matches the partitioning expected by binary_search_by.
     let best = match all_commits.binary_search_by(|(_, t)| target_timestamp.cmp(t)) {
         Ok(idx) => Some(&all_commits[idx]),
         Err(idx) => {
@@ -376,6 +385,7 @@ fn measure_size_at_commit(
             "rev-list",
             "--objects",
             "--disk-usage",
+            "--use-bitmap-index",
             commit_hash,
         ])
         .output()
