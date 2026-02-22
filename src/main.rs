@@ -451,9 +451,9 @@ fn measure_size_at_commit(
             .map_err(|e| GitSizeError::Command(format!("Failed writing to stdin: {}", e)))?;
 
         // Clean up rev-list process
-        rev_list
-            .wait()
-            .map_err(|e| GitSizeError::Command(format!("Failed to wait for git rev-list: {}", e)))?;
+        rev_list.wait().map_err(|e| {
+            GitSizeError::Command(format!("Failed to wait for git rev-list: {}", e))
+        })?;
 
         let mut total = 0u64;
         let mut blob_count = 0u64;
