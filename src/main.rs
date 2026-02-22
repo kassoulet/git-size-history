@@ -423,21 +423,36 @@ fn measure_size_at_commit(
             GitSizeError::Command("Failed to open git rev-list stdout".to_string())
         })?;
 
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
+        // Use a separate thread to write to cat-file's stdin while reading its stdout.
+        // This prevents a deadlock when the pipe buffers fill up.
+        let stdin_handle = std::thread::spawn(move || -> io::Result<()> {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
 
-        while reader.read_line(&mut line)? > 0 {
-            if let Some(oid) = line.split_whitespace().next() {
-                stdin.write_all(oid.as_bytes())?;
-                stdin.write_all(b"\n")?;
+            while reader.read_line(&mut line)? > 0 {
+                if let Some(oid) = line.split_whitespace().next() {
+                    stdin.write_all(oid.as_bytes())?;
+                    stdin.write_all(b"\n")?;
+                }
+                line.clear();
             }
-            line.clear();
-        }
-
-        drop(stdin); // Close stdin to signal end of input
+            drop(stdin); // Close stdin to signal end of input
+            Ok(())
+        });
 
         let output = cat_file.wait_with_output().map_err(|e| {
             GitSizeError::Command(format!("Failed to wait for git cat-file: {}", e))
+        })?;
+
+        // Ensure the stdin writing thread finished successfully
+        stdin_handle
+            .join()
+            .map_err(|_| GitSizeError::Command("Stdin thread panicked".to_string()))?
+            .map_err(|e| GitSizeError::Command(format!("Failed writing to stdin: {}", e)))?;
+
+        // Clean up rev-list process
+        rev_list.wait().map_err(|e| {
+            GitSizeError::Command(format!("Failed to wait for git rev-list: {}", e))
         })?;
 
         let mut total = 0u64;
@@ -721,8 +736,7 @@ fn main() -> Result<()> {
                 &sample.commit_hash,
                 args.debug,
                 args.uncompressed,
-            )
-            .unwrap(); // In parallel context, we panic on error
+            )?;
 
             pb.set_message(format!(
                 "Sampling {} ({})",
@@ -731,13 +745,13 @@ fn main() -> Result<()> {
             ));
             pb.inc(1);
 
-            SizeMeasurement {
+            Ok(SizeMeasurement {
                 date: sample.date.clone(),
                 cumulative_size: packed_size,
                 uncompressed_size,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     pb.finish_with_message("Sampling complete");
 
