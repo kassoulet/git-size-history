@@ -9,16 +9,18 @@
 ## Features
 
 - **Fast**: Efficient size measurement, multithreaded processing
-- **Visual**: Generates PNG plots of size over time
+- **Visual**: Generates PNG plots of size over time (and CSV data for further analysis)
 - **Safe**: Read-only operations, never modifies your repository
 - **Cross-platform**: Works on Linux, macOS, and Windows
+- **Use Bitmap Index**: Leverages git's bitmap index for fast object counting and size estimation 
+
+> Use ```git repack -a -d --write-bitmap-index``` to create a bitmap index for faster analysis on large repositories.
 
 ```
-  [00:00:35] Analysis complete
-  [00:02:27] [========================================] 22/22 Sampling complete
-Writing CSV to linux.csv
-Generating plot: linux.png
-Plot saved to linux.png
+$ time target/release/git-size-history ~/tmp/linux -o linux-bm.csv --plot linux-bm.png
+  [00:00:37] Analysis complete                                                                                                                                                            [00:00:04] [========================================] 22/22 Sampling complete                                                                                                         Writing CSV to linux-bm.csv
+Generating plot: linux-bm.png
+Plot saved to linux-bm.png
 
 === Summary ===
 Repository: /home/gautier/tmp/linux
@@ -26,19 +28,19 @@ Total commits analyzed: 1426552
 Time span: 2005-04-16 to 2026-02-21 (20.8 years)
 Sample points: 22
 Sampling method: yearly
-Initial size (2005-04-16): 53.15 MB
-Final size (2026-02-21): 6.21 GB
-Total growth: 6.16 GB
+Initial size (2005-04-16): 53.14 MB
+Final size (2026-02-21): 6.20 GB
+Total growth: 6.15 GB
 
-Output written to linux.csv
-Plot saved to linux.png
+Output written to linux-bm.csv
+Plot saved to linux-bm.png
 
-real	2m58,745s
-user	18m44,509s
-sys	0m19,285s
+real	0m43,268s
 ```
 
-Scanning the size history of 1.4M commits in 3 minutes!
+Scanning the size history of 1.4M commits in 43 seconds!
+
+(Without bitmap index, it takes 3 minutes)
 
 ![](linux.png)
 
