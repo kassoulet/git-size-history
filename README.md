@@ -200,6 +200,18 @@ Try these optimizations:
 3. Ensure repository is on fast storage (SSD recommended)
 4. Run `git gc` on the repository first
 
+### High Memory Usage
+
+Analyzing large repositories (e.g., Linux kernel with 1.4M+ commits) can consume significant memory due to parallel processing. We use [Rayon](https://github.com/rayon-rs/rayon) for parallelism, which by default uses all available CPU cores.
+
+**To limit memory usage:**
+
+1. **Reduce parallel threads** using `RAYON_NUM_THREADS`:
+   ```bash
+   # Limit to 2 threads (reduces memory pressure)
+   RAYON_NUM_THREADS=2 git-size-history -o output.csv /path/to/repo
+   ```
+
 ## Development
 
 ### Build from Source
