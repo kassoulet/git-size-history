@@ -156,15 +156,44 @@ const YEARLY_INTERVAL_DAYS: i64 = 365;
 /// Sampling interval in days for monthly sampling
 const MONTHLY_INTERVAL_DAYS: i64 = 30;
 
+/// Check if the repository has a bitmap index available.
+///
+/// Bitmap indexes are stored in .git/objects/pack/ directory as .bitmap files.
+/// They significantly speed up git rev-list --disk-usage operations.
+fn check_bitmap_index(repo_path: &Path) -> bool {
+    let pack_dir = repo_path.join(".git/objects/pack");
+    if let Ok(entries) = std::fs::read_dir(&pack_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().map_or(false, |ext| ext == "bitmap") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Get the first (oldest) and last (newest) commits from the repository.
 ///
 /// This function walks the commit history using git2 and collects all commits
 /// with their timestamps for efficient binary search during sampling.
+/// Uses parallel processing for large repositories.
 fn get_commit_range<'a>(
     repo: &'a Repository,
-    _repo_path: &Path,
+    repo_path: &Path,
     analysis_pb: &ProgressBar,
 ) -> Result<CommitRange<'a>> {
+    // Check for bitmap index and warn if not present
+    let has_bitmap = check_bitmap_index(repo_path);
+    if !has_bitmap {
+        eprintln!(
+            "⚠️  Warning: No bitmap index found in repository.\n\
+             Running 'git repack -ad --write-bitmap-index' can significantly speed up size measurements.\n\
+             Example: cd {:?} && git repack -ad --write-bitmap-index",
+            repo_path
+        );
+    }
+
+    // First pass: collect all OIDs using git2 revwalk (fast)
     let mut revwalk = repo.revwalk().map_err(|e| {
         GitSizeError::Validation(format!(
             "Failed to create commit walker. Git error: {}",
@@ -179,21 +208,18 @@ fn get_commit_range<'a>(
     })?;
     revwalk.set_sorting(Sort::TIME)?;
 
-    // Collect all commits with their hashes and timestamps
-    let mut commits: Vec<(String, i64)> = Vec::new();
-    
+    // Collect all OIDs first
+    let mut oids: Vec<git2::Oid> = Vec::new();
     for oid_result in revwalk {
         match oid_result {
             Ok(oid) => {
-                if let Ok(commit) = repo.find_commit(oid) {
-                    commits.push((oid.to_string(), commit.time().seconds()));
-                    // Update progress every 100k commits
-                    if commits.len() % 100000 == 0 {
-                        analysis_pb.set_message(format!(
-                            "Reading commit history... {} commits",
-                            commits.len()
-                        ));
-                    }
+                oids.push(oid);
+                // Update progress every 100k commits
+                if oids.len() % 100000 == 0 {
+                    analysis_pb.set_message(format!(
+                        "Reading commit history... {} commits",
+                        oids.len()
+                    ));
                 }
             }
             Err(e) => {
@@ -205,13 +231,38 @@ fn get_commit_range<'a>(
         }
     }
 
-    let commit_count = commits.len() as u32;
-    
+    let commit_count = oids.len() as u32;
+
     if commit_count == 0 {
         return Err(GitSizeError::Validation(
             "No commits found in repository".to_string(),
         ));
     }
+
+    analysis_pb.set_message(format!(
+        "Processing {} commits (parallel)...",
+        commit_count
+    ));
+
+    // Second pass: parallel fetch of commit timestamps
+    // git2::Repository is not Sync, so we need to reopen the repo in each thread
+    let repo_path_arc = std::sync::Arc::new(repo_path.to_path_buf());
+    
+    let commits: Vec<(String, i64)> = oids
+        .par_iter()
+        .map(|oid| {
+            // Each thread opens its own repository handle
+            match Repository::open(repo_path_arc.as_path()) {
+                Ok(thread_repo) => {
+                    match thread_repo.find_commit(*oid) {
+                        Ok(commit) => (oid.to_string(), commit.time().seconds()),
+                        Err(_) => (oid.to_string(), 0),
+                    }
+                }
+                Err(_) => (oid.to_string(), 0),
+            }
+        })
+        .collect();
 
     analysis_pb.set_message(format!("Found {} commits", commit_count));
 
