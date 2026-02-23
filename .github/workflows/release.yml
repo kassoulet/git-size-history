@@ -59,7 +59,7 @@ jobs:
             artifact_name: git-size-history-x86_64-windows
             binary_name: git-size-history.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -93,7 +93,7 @@ jobs:
   #   runs-on: ubuntu-latest
   #   if: github.repository == 'kassoulet/git-size-history'
   #   steps:
-  #     - uses: actions/checkout@v4
+  #     - uses: actions/checkout@v6
 
   #     - name: Install Rust
   #       uses: dtolnay/rust-toolchain@stable
