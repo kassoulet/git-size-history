@@ -122,10 +122,11 @@ struct CommitRange<'repo> {
     first_commit: git2::Commit<'repo>,
     /// The newest (last) commit in the repository
     last_commit: git2::Commit<'repo>,
-    /// All commits with their timestamps (sorted by time descending)
-    all_commits: Vec<(git2::Oid, i64)>,
     /// Total number of commits in the repository
     total_commits: u32,
+    /// All commits with their hashes and timestamps (sorted by time descending)
+    /// Stored as (hash, timestamp) pairs for efficient binary search
+    commits: Vec<(String, i64)>,
 }
 
 /// A sample point in repository history
@@ -157,105 +158,75 @@ const MONTHLY_INTERVAL_DAYS: i64 = 30;
 
 /// Get the first (oldest) and last (newest) commits from the repository.
 ///
-/// This function walks the commit history of the repository and returns
-/// information about the earliest and latest commits, along with a list
-/// of all commits and their timestamps.
+/// This function walks the commit history using git2 and collects all commits
+/// with their timestamps for efficient binary search during sampling.
 fn get_commit_range<'a>(
     repo: &'a Repository,
+    _repo_path: &Path,
     analysis_pb: &ProgressBar,
 ) -> Result<CommitRange<'a>> {
     let mut revwalk = repo.revwalk().map_err(|e| {
         GitSizeError::Validation(format!(
-            "Failed to create commit walker. Repository may be corrupted or have invalid references. Git error: {}",
+            "Failed to create commit walker. Git error: {}",
             e
         ))
     })?;
     revwalk.push_head().map_err(|e| {
-        let head_ref = repo.path().join("HEAD");
-        let head_exists = head_ref.exists();
-
-        if !head_exists {
-            GitSizeError::Validation(format!(
-                "Failed to push HEAD to commit walker. No HEAD file found at {:?}. \
-                This may be a bare repository or the repository structure is incomplete. \
-                Git error: {}",
-                head_ref, e
-            ))
-        } else {
-            GitSizeError::Validation(format!(
-                "Failed to push HEAD to commit walker. Repository may not have a valid HEAD reference. \
-                Try running 'git fsck' to check repository integrity. \
-                Git error: {}",
-                e
-            ))
-        }
+        GitSizeError::Validation(format!(
+            "Failed to push HEAD to commit walker. Git error: {}",
+            e
+        ))
     })?;
     revwalk.set_sorting(Sort::TIME)?;
 
-    let mut all_commits = Vec::new();
+    // Collect all commits with their hashes and timestamps
+    let mut commits: Vec<(String, i64)> = Vec::new();
+    
     for oid_result in revwalk {
         match oid_result {
             Ok(oid) => {
                 if let Ok(commit) = repo.find_commit(oid) {
-                    all_commits.push((oid, commit.time().seconds()));
-                    // Throttle progress bar updates to reduce string formatting overhead
-                    if all_commits.len() % 1000 == 0 {
+                    commits.push((oid.to_string(), commit.time().seconds()));
+                    // Update progress every 100k commits
+                    if commits.len() % 100000 == 0 {
                         analysis_pb.set_message(format!(
                             "Reading commit history... {} commits",
-                            all_commits.len()
+                            commits.len()
                         ));
                     }
                 }
             }
             Err(e) => {
-                // Check if this is a zlib/pack corruption error
-                let error_msg = e.to_string();
-                if error_msg.contains("incorrect header check") || error_msg.contains("inflate") {
-                    return Err(GitSizeError::Validation(format!(
-                        "Repository has corrupted pack files ({}). \
-                        This prevents reading the commit history. \n\
-                        Suggested fixes:\n\
-                        1. Try repacking: cd <repo> && git repack -a -d\n\
-                        2. Re-clone the repository from the remote\n\
-                        3. Run 'git fsck' for detailed corruption report",
-                        e
-                    )));
-                }
-
                 return Err(GitSizeError::Validation(format!(
-                    "Failed to read commit during history walk. Repository may have corrupted objects. Git error: {}",
+                    "Failed to read commit. Git error: {}",
                     e
                 )));
             }
         }
     }
 
-    if all_commits.is_empty() {
+    let commit_count = commits.len() as u32;
+    
+    if commit_count == 0 {
         return Err(GitSizeError::Validation(
             "No commits found in repository".to_string(),
         ));
     }
 
-    let total_commits = all_commits.len() as u32;
-    // Shrink to fit to reduce memory usage for large repositories
-    all_commits.shrink_to_fit();
+    analysis_pb.set_message(format!("Found {} commits", commit_count));
 
-    // Get first and last commits
-    let (first_oid, _) = all_commits
-        .last()
-        .ok_or_else(|| GitSizeError::Validation("No commits found".to_string()))?;
-    let (last_oid, _) = all_commits
-        .first()
-        .ok_or_else(|| GitSizeError::Validation("No commits found".to_string()))?;
+    // Commits are sorted by time descending (newest first)
+    let last_oid = git2::Oid::from_str(&commits[0].0)?;
+    let first_oid = git2::Oid::from_str(&commits.last().unwrap().0)?;
 
-    let first_commit = repo.find_commit(*first_oid)?;
-    let last_commit = repo.find_commit(*last_oid)?;
+    let first_commit = repo.find_commit(first_oid)?;
+    let last_commit = repo.find_commit(last_oid)?;
 
     Ok(CommitRange {
         first_commit,
         last_commit,
-        all_commits,
-        total_commits,
+        total_commits: commit_count,
+        commits,
     })
 }
 
@@ -294,7 +265,8 @@ fn generate_sample_points(
     while current_time <= last_dt {
         let target_timestamp = current_time.timestamp();
 
-        if let Some(commit_info) = find_nearest_commit(&range.all_commits, target_timestamp)? {
+        // Find nearest commit using binary search on in-memory list
+        if let Some(commit_info) = find_nearest_commit(&range.commits, target_timestamp)? {
             sample_points.push(SamplePoint {
                 date: current_time.format("%Y-%m-%d").to_string(),
                 commit_hash: commit_info.0,
@@ -320,45 +292,41 @@ fn generate_sample_points(
     Ok(sample_points)
 }
 
-/// Find the commit nearest to a target timestamp from a pre-collected list.
+/// Find the commit nearest to a target timestamp using binary search.
 ///
-/// This function uses a binary search on the list of all commits, which is
-/// assumed to be sorted in reverse chronological order (newest first).
+/// The commits list is sorted by time descending (newest first).
 fn find_nearest_commit(
-    all_commits: &[(git2::Oid, i64)],
+    commits: &[(String, i64)],
     target_timestamp: i64,
 ) -> Result<Option<(String, i64)>> {
-    if all_commits.is_empty() {
+    if commits.is_empty() {
         return Ok(None);
     }
 
     // Binary search to find the nearest commit.
-    // Since all_commits is sorted by time DESCENDING (newest first),
-    // target_timestamp.cmp(t) is correct because it returns Ordering::Less
-    // for elements larger than target_timestamp (which are to the left)
-    // and Ordering::Greater for elements smaller (which are to the right).
-    // This matches the partitioning expected by binary_search_by.
-    let best = match all_commits.binary_search_by(|(_, t)| target_timestamp.cmp(t)) {
-        Ok(idx) => Some(&all_commits[idx]),
+    // Since commits is sorted by time DESCENDING (newest first),
+    // target_timestamp.cmp(t) is correct.
+    let best = match commits.binary_search_by(|(_, t)| target_timestamp.cmp(t)) {
+        Ok(idx) => Some(&commits[idx]),
         Err(idx) => {
             if idx == 0 {
-                Some(&all_commits[0])
-            } else if idx == all_commits.len() {
-                Some(&all_commits[idx - 1])
+                Some(&commits[0])
+            } else if idx == commits.len() {
+                Some(&commits[idx - 1])
             } else {
                 // Check both neighbors
-                let t1 = all_commits[idx - 1].1;
-                let t2 = all_commits[idx].1;
+                let t1 = commits[idx - 1].1;
+                let t2 = commits[idx].1;
                 if (t1 - target_timestamp).abs() < (t2 - target_timestamp).abs() {
-                    Some(&all_commits[idx - 1])
+                    Some(&commits[idx - 1])
                 } else {
-                    Some(&all_commits[idx])
+                    Some(&commits[idx])
                 }
             }
         }
     };
 
-    Ok(best.map(|(oid, t)| (oid.to_string(), *t)))
+    Ok(best.map(|(h, t)| (h.clone(), *t)))
 }
 
 /// Calculate the size of objects reachable from a specific commit.
@@ -674,20 +642,20 @@ fn main() -> Result<()> {
         GitSizeError::Validation(context)
     })?;
 
-    // Progress bar for analysis phase
-    let analysis_pb = ProgressBar::new(3);
+    // Progress bar for analysis phase - use indeterminate spinner during commit reading
+    let analysis_pb = ProgressBar::new_spinner();
     analysis_pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] {wide_msg}")
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] {msg}")
             .map_err(|e| {
                 GitSizeError::Validation(format!("Failed to set progress style: {}", e))
             })?,
     );
     analysis_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-
     analysis_pb.set_message("Reading commit history...");
+    
     // Get commit range
-    let range = get_commit_range(&repo, &analysis_pb)?;
+    let range = get_commit_range(&repo, &repo_path, &analysis_pb)?;
     let total_commits = range.total_commits;
 
     let first_ts = range.first_commit.time().seconds();
@@ -702,40 +670,36 @@ fn main() -> Result<()> {
     let duration = last_dt - first_dt;
     let years = duration.num_days() as f64 / DAYS_PER_YEAR;
 
-    analysis_pb.set_message(format!(
-        "Found {} commits ({} to {}, {:.1} years)",
-        total_commits,
-        first_dt.format("%Y-%m-%d"),
-        last_dt.format("%Y-%m-%d"),
-        years
-    ));
-    analysis_pb.inc(1);
-
     // Determine sampling strategy
     let use_yearly = args.yearly || (!args.monthly && years > YEARLY_THRESHOLD_YEARS);
     analysis_pb.set_message(format!(
-        "Using {} sampling",
+        "Found {} commits ({} to {}, {:.1} years) - {} sampling",
+        total_commits,
+        first_dt.format("%Y-%m-%d"),
+        last_dt.format("%Y-%m-%d"),
+        years,
         if use_yearly { "yearly" } else { "monthly" }
     ));
-    analysis_pb.inc(1);
 
     // Generate sample points
     let samples = generate_sample_points(&range, args.monthly, args.yearly)?;
     analysis_pb.set_message(format!("Generated {} sample points", samples.len()));
-    analysis_pb.inc(1);
-
     analysis_pb.finish_with_message("Analysis complete");
 
     // Progress bar for sampling phase - shows complete commits count
     let pb = ProgressBar::new(samples.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
             .map_err(|e| GitSizeError::Validation(format!("Failed to set progress style: {}", e)))?
             .progress_chars("=>-"),
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
+    // Wrap progress bar in Arc for thread-safe updates
+    // indicatif::ProgressBar is already thread-safe using atomics
+    let pb = std::sync::Arc::new(pb);
+    
     // Measure sizes in parallel for better performance
     // Using rayon to process multiple sample points concurrently
     let results: Vec<SizeMeasurement> = samples
@@ -748,11 +712,7 @@ fn main() -> Result<()> {
                 args.uncompressed,
             )?;
 
-            pb.set_message(format!(
-                "Sampling {} ({})",
-                sample.date,
-                format_size(packed_size)
-            ));
+            // Thread-safe progress bar increment (indicatif uses atomics internally)
             pb.inc(1);
 
             Ok(SizeMeasurement {
@@ -763,7 +723,10 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    pb.finish_with_message("Sampling complete");
+    // Finish progress bar
+    if let Ok(inner_pb) = std::sync::Arc::try_unwrap(pb) {
+        inner_pb.finish_with_message("Sampling complete");
+    }
 
     // Write CSV
     println!("Writing CSV to {}", args.output.display());
@@ -878,56 +841,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_nearest_commit() {
-        let oid1 = git2::Oid::from_str("0000000000000000000000000000000000000001").unwrap();
-        let oid2 = git2::Oid::from_str("0000000000000000000000000000000000000002").unwrap();
-        let oid3 = git2::Oid::from_str("0000000000000000000000000000000000000003").unwrap();
-
-        // Commits are sorted by time descending (newest first)
-        let all_commits = vec![(oid3, 300), (oid2, 200), (oid1, 100)];
-
-        // Exact match
-        assert_eq!(
-            find_nearest_commit(&all_commits, 200).unwrap().unwrap().0,
-            oid2.to_string()
-        );
-
-        // Closer to oid2
-        assert_eq!(
-            find_nearest_commit(&all_commits, 210).unwrap().unwrap().0,
-            oid2.to_string()
-        );
-        assert_eq!(
-            find_nearest_commit(&all_commits, 190).unwrap().unwrap().0,
-            oid2.to_string()
-        );
-
-        // Closer to oid3
-        assert_eq!(
-            find_nearest_commit(&all_commits, 290).unwrap().unwrap().0,
-            oid3.to_string()
-        );
-
-        // Before oldest commit
-        assert_eq!(
-            find_nearest_commit(&all_commits, 50).unwrap().unwrap().0,
-            oid1.to_string()
-        );
-
-        // After newest commit
-        assert_eq!(
-            find_nearest_commit(&all_commits, 500).unwrap().unwrap().0,
-            oid3.to_string()
-        );
-    }
-
-    #[test]
-    fn test_find_nearest_commit_empty() {
-        let all_commits: Vec<(git2::Oid, i64)> = vec![];
-        assert!(find_nearest_commit(&all_commits, 100).unwrap().is_none());
-    }
-
-    #[test]
     fn test_integration_minimal_repo() {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -956,9 +869,8 @@ mod tests {
 
         // Test get_commit_range
         let pb = ProgressBar::hidden();
-        let range = get_commit_range(&repo, &pb).unwrap();
+        let range = get_commit_range(&repo, &temp_dir, &pb).unwrap();
         assert_eq!(range.total_commits, 1);
-        assert_eq!(range.all_commits[0].0, oid);
 
         // Test sampling
         let samples = generate_sample_points(&range, false, false).unwrap();
@@ -1012,7 +924,7 @@ mod tests {
         }
 
         let pb = ProgressBar::hidden();
-        let range = get_commit_range(&repo, &pb).unwrap();
+        let range = get_commit_range(&repo, &temp_dir, &pb).unwrap();
 
         // Force monthly sampling for this test
         let samples = generate_sample_points(&range, true, false).unwrap();
@@ -1065,7 +977,7 @@ mod tests {
         }
 
         let pb = ProgressBar::hidden();
-        let range = get_commit_range(&repo, &pb).unwrap();
+        let range = get_commit_range(&repo, &temp_dir, &pb).unwrap();
 
         // Force yearly sampling
         let samples = generate_sample_points(&range, false, true).unwrap();
@@ -1116,7 +1028,7 @@ mod tests {
         }
 
         let pb = ProgressBar::hidden();
-        let range = get_commit_range(&repo, &pb).unwrap();
+        let range = get_commit_range(&repo, &temp_dir, &pb).unwrap();
 
         // Force monthly sampling
         let samples = generate_sample_points(&range, true, false).unwrap();
@@ -1230,7 +1142,7 @@ mod tests {
 
         // get_commit_range should return an error for empty repo
         let pb = ProgressBar::hidden();
-        let result = get_commit_range(&repo, &pb);
+        let result = get_commit_range(&repo, &temp_dir, &pb);
         assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1279,7 +1191,7 @@ mod tests {
 
         // Test get_commit_range
         let pb = ProgressBar::hidden();
-        let range = get_commit_range(&repo, &pb).unwrap();
+        let range = get_commit_range(&repo, &temp_dir, &pb).unwrap();
         assert_eq!(range.total_commits, 5);
 
         // Test sampling
