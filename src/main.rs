@@ -455,7 +455,7 @@ fn measure_size_at_commit(
             GitSizeError::Command("Failed to open git rev-list stdout".to_string())
         })?;
 
-        let cat_file_stdout = cat_file.stdout.take().ok_or_else(|| {
+        let stdout = cat_file.stdout.take().ok_or_else(|| {
             GitSizeError::Command("Failed to open git cat-file stdout".to_string())
         })?;
 
@@ -475,10 +475,6 @@ fn measure_size_at_commit(
             drop(stdin); // Close stdin to signal end of input
             Ok(())
         });
-
-        let stdout = cat_file.stdout.take().ok_or_else(|| {
-            GitSizeError::Command("Failed to open git cat-file stdout".to_string())
-        })?;
 
         let mut total = 0u64;
         let mut blob_count = 0u64;
