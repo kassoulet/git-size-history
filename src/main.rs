@@ -170,7 +170,9 @@ fn get_commit_range<'a>(
     let mut child = Command::new("git")
         .args([
             "-C",
-            repo_path.to_str().ok_or_else(|| GitSizeError::Validation("Invalid repo path".to_string()))?,
+            repo_path
+                .to_str()
+                .ok_or_else(|| GitSizeError::Validation("Invalid repo path".to_string()))?,
             "rev-list",
             "--format=%H %ct",
             "HEAD",
@@ -180,9 +182,10 @@ fn get_commit_range<'a>(
         .spawn()
         .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
 
-    let stdout = child.stdout.take().ok_or_else(|| {
-        GitSizeError::Command("Failed to open git rev-list stdout".to_string())
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitSizeError::Command("Failed to open git rev-list stdout".to_string()))?;
 
     let mut all_commits = Vec::new();
     let reader = BufReader::new(stdout);
