@@ -162,7 +162,7 @@ fn check_bitmap_index(repo_path: &Path) -> bool {
     let pack_dir = repo_path.join(".git/objects/pack");
     if let Ok(entries) = std::fs::read_dir(&pack_dir) {
         for entry in entries.flatten() {
-            if entry.path().extension().map_or(false, |ext| ext == "bitmap") {
+            if entry.path().extension().is_some_and(|ext| ext == "bitmap") {
                 return true;
             }
         }
