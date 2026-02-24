@@ -373,6 +373,13 @@ fn measure_size_at_commit(
     debug: bool,
     calculate_uncompressed: bool,
 ) -> Result<(u64, Option<u64>)> {
+    // Basic validation
+    if commit_hash.is_empty() {
+        return Err(GitSizeError::Validation(
+            "Commit hash cannot be empty".to_string(),
+        ));
+    }
+
     let repo_path_str = source_repo.to_str().ok_or_else(|| {
         GitSizeError::Validation(format!("Invalid repository path: {:?}", source_repo))
     })?;
@@ -380,6 +387,7 @@ fn measure_size_at_commit(
     // Get packed disk usage using git rev-list --disk-usage
     let disk_usage_output = Command::new("git")
         .args([
+            "--no-replace-objects",
             "-C",
             repo_path_str,
             "rev-list",
@@ -408,13 +416,21 @@ fn measure_size_at_commit(
     // Calculate uncompressed size only if requested (it's slower)
     let uncompressed_size = if calculate_uncompressed {
         let mut rev_list = Command::new("git")
-            .args(["-C", repo_path_str, "rev-list", "--objects", commit_hash])
+            .args([
+                "--no-replace-objects",
+                "-C",
+                repo_path_str,
+                "rev-list",
+                "--objects",
+                commit_hash,
+            ])
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
 
         let mut cat_file = Command::new("git")
             .args([
+                "--no-replace-objects",
                 "-C",
                 repo_path_str,
                 "cat-file",
@@ -429,14 +445,18 @@ fn measure_size_at_commit(
             GitSizeError::Command("Failed to open git cat-file stdin".to_string())
         })?;
 
-        let stdout = rev_list.stdout.take().ok_or_else(|| {
+        let rev_list_stdout = rev_list.stdout.take().ok_or_else(|| {
             GitSizeError::Command("Failed to open git rev-list stdout".to_string())
+        })?;
+
+        let cat_file_stdout = cat_file.stdout.take().ok_or_else(|| {
+            GitSizeError::Command("Failed to open git cat-file stdout".to_string())
         })?;
 
         // Use a separate thread to write to cat-file's stdin while reading its stdout.
         // This prevents a deadlock when the pipe buffers fill up.
         let stdin_handle = std::thread::spawn(move || -> io::Result<()> {
-            let mut reader = BufReader::new(stdout);
+            let mut reader = BufReader::new(rev_list_stdout);
             let mut line = String::new();
 
             while reader.read_line(&mut line)? > 0 {
@@ -450,26 +470,14 @@ fn measure_size_at_commit(
             Ok(())
         });
 
-        let output = cat_file.wait_with_output().map_err(|e| {
-            GitSizeError::Command(format!("Failed to wait for git cat-file: {}", e))
-        })?;
-
-        // Ensure the stdin writing thread finished successfully
-        stdin_handle
-            .join()
-            .map_err(|_| GitSizeError::Command("Stdin thread panicked".to_string()))?
-            .map_err(|e| GitSizeError::Command(format!("Failed writing to stdin: {}", e)))?;
-
-        // Clean up rev-list process
-        rev_list.wait().map_err(|e| {
-            GitSizeError::Command(format!("Failed to wait for git rev-list: {}", e))
-        })?;
-
         let mut total = 0u64;
         let mut blob_count = 0u64;
         let mut object_count = 0u64;
 
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
+        // Process cat-file output as a stream to avoid OOM for large repositories
+        let mut reader = BufReader::new(cat_file_stdout);
+        let mut line = String::new();
+        while reader.read_line(&mut line)? > 0 {
             object_count += 1;
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 3 && parts[1] == "blob" {
@@ -478,6 +486,31 @@ fn measure_size_at_commit(
                     blob_count += 1;
                 }
             }
+            line.clear();
+        }
+
+        // Wait for cat-file and ensure it finished successfully
+        let status = cat_file.wait().map_err(|e| {
+            GitSizeError::Command(format!("Failed to wait for git cat-file: {}", e))
+        })?;
+
+        if !status.success() {
+            return Err(GitSizeError::Command("git cat-file failed".to_string()));
+        }
+
+        // Ensure the stdin writing thread finished successfully
+        stdin_handle
+            .join()
+            .map_err(|_| GitSizeError::Command("Stdin thread panicked".to_string()))?
+            .map_err(|e| GitSizeError::Command(format!("Failed writing to stdin: {}", e)))?;
+
+        // Clean up rev-list process and ensure it finished successfully
+        let status = rev_list.wait().map_err(|e| {
+            GitSizeError::Command(format!("Failed to wait for git rev-list: {}", e))
+        })?;
+
+        if !status.success() {
+            return Err(GitSizeError::Command("git rev-list failed".to_string()));
         }
 
         if debug {
