@@ -9,7 +9,7 @@
 use chrono::{DateTime, Duration, NaiveDate};
 use clap::Parser;
 use csv::Writer;
-use git2::{Repository, Sort};
+use git2::Repository;
 use indicatif::{ProgressBar, ProgressStyle};
 use plotters::prelude::*;
 use rayon::prelude::*;
@@ -164,70 +164,75 @@ fn get_commit_range<'a>(
     repo: &'a Repository,
     analysis_pb: &ProgressBar,
 ) -> Result<CommitRange<'a>> {
-    let mut revwalk = repo.revwalk().map_err(|e| {
-        GitSizeError::Validation(format!(
-            "Failed to create commit walker. Repository may be corrupted or have invalid references. Git error: {}",
-            e
-        ))
-    })?;
-    revwalk.push_head().map_err(|e| {
-        let head_ref = repo.path().join("HEAD");
-        let head_exists = head_ref.exists();
+    // Use git rev-list directly for much faster commit history traversal.
+    // This avoids parsing every commit object in the repository.
+    let repo_path = repo.path();
+    let mut child = Command::new("git")
+        .args([
+            "-C",
+            repo_path.to_str().ok_or_else(|| GitSizeError::Validation("Invalid repo path".to_string()))?,
+            "rev-list",
+            "--format=%H %ct",
+            "HEAD",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
 
-        if !head_exists {
-            GitSizeError::Validation(format!(
-                "Failed to push HEAD to commit walker. No HEAD file found at {:?}. \
-                This may be a bare repository or the repository structure is incomplete. \
-                Git error: {}",
-                head_ref, e
-            ))
-        } else {
-            GitSizeError::Validation(format!(
-                "Failed to push HEAD to commit walker. Repository may not have a valid HEAD reference. \
-                Try running 'git fsck' to check repository integrity. \
-                Git error: {}",
-                e
-            ))
-        }
+    let stdout = child.stdout.take().ok_or_else(|| {
+        GitSizeError::Command("Failed to open git rev-list stdout".to_string())
     })?;
-    revwalk.set_sorting(Sort::TIME)?;
 
     let mut all_commits = Vec::new();
-    for oid_result in revwalk {
-        match oid_result {
-            Ok(oid) => {
-                if let Ok(commit) = repo.find_commit(oid) {
-                    all_commits.push((oid, commit.time().seconds()));
-                    // Throttle progress bar updates to reduce string formatting overhead
-                    if all_commits.len() % 1000 == 0 {
-                        analysis_pb.set_message(format!(
-                            "Reading commit history... {} commits",
-                            all_commits.len()
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                // Check if this is a zlib/pack corruption error
-                let error_msg = e.to_string();
-                if error_msg.contains("incorrect header check") || error_msg.contains("inflate") {
-                    return Err(GitSizeError::Validation(format!(
-                        "Repository has corrupted pack files ({}). \
-                        This prevents reading the commit history. \n\
-                        Suggested fixes:\n\
-                        1. Try repacking: cd <repo> && git repack -a -d\n\
-                        2. Re-clone the repository from the remote\n\
-                        3. Run 'git fsck' for detailed corruption report",
-                        e
-                    )));
-                }
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        let line = line?;
+        if line.starts_with("commit ") {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if let (Some(oid_str), Some(ts_str)) = (parts.next(), parts.next()) {
+            let oid = git2::Oid::from_str(oid_str)?;
+            let ts = ts_str.parse::<i64>().map_err(|_| {
+                GitSizeError::Command(format!("Failed to parse timestamp: {}", ts_str))
+            })?;
+            all_commits.push((oid, ts));
 
-                return Err(GitSizeError::Validation(format!(
-                    "Failed to read commit during history walk. Repository may have corrupted objects. Git error: {}",
-                    e
-                )));
+            if all_commits.len() % 1000 == 0 {
+                analysis_pb.set_message(format!(
+                    "Reading commit history... {} commits",
+                    all_commits.len()
+                ));
             }
         }
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut err_pipe) = child.stderr.take() {
+            use std::io::Read;
+            err_pipe.read_to_string(&mut stderr)?;
+        }
+
+        if stderr.contains("incorrect header check") || stderr.contains("inflate") {
+            return Err(GitSizeError::Validation(format!(
+                "Repository has corrupted pack files. \
+                This prevents reading the commit history. \n\
+                Suggested fixes:\n\
+                1. Try repacking: cd <repo> && git repack -a -d\n\
+                2. Re-clone the repository from the remote\n\
+                3. Run 'git fsck' for detailed corruption report\n\
+                Git error: {}",
+                stderr
+            )));
+        }
+
+        return Err(GitSizeError::Command(format!(
+            "git rev-list failed: {}",
+            stderr
+        )));
     }
 
     if all_commits.is_empty() {
@@ -450,9 +455,31 @@ fn measure_size_at_commit(
             Ok(())
         });
 
-        let output = cat_file.wait_with_output().map_err(|e| {
-            GitSizeError::Command(format!("Failed to wait for git cat-file: {}", e))
+        let stdout = cat_file.stdout.take().ok_or_else(|| {
+            GitSizeError::Command("Failed to open git cat-file stdout".to_string())
         })?;
+
+        let mut total = 0u64;
+        let mut blob_count = 0u64;
+        let mut object_count = 0u64;
+
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let line = line?;
+            object_count += 1;
+            let mut parts = line.split_whitespace();
+            let _oid = parts.next();
+            let kind = parts.next();
+            let size = parts.next();
+            if kind == Some("blob") {
+                if let Some(s) = size {
+                    if let Ok(s_u64) = s.parse::<u64>() {
+                        total += s_u64;
+                        blob_count += 1;
+                    }
+                }
+            }
+        }
 
         // Ensure the stdin writing thread finished successfully
         stdin_handle
@@ -460,25 +487,13 @@ fn measure_size_at_commit(
             .map_err(|_| GitSizeError::Command("Stdin thread panicked".to_string()))?
             .map_err(|e| GitSizeError::Command(format!("Failed writing to stdin: {}", e)))?;
 
-        // Clean up rev-list process
+        // Clean up processes
+        cat_file.wait().map_err(|e| {
+            GitSizeError::Command(format!("Failed to wait for git cat-file: {}", e))
+        })?;
         rev_list.wait().map_err(|e| {
             GitSizeError::Command(format!("Failed to wait for git rev-list: {}", e))
         })?;
-
-        let mut total = 0u64;
-        let mut blob_count = 0u64;
-        let mut object_count = 0u64;
-
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            object_count += 1;
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 && parts[1] == "blob" {
-                if let Ok(size) = parts[2].parse::<u64>() {
-                    total += size;
-                    blob_count += 1;
-                }
-            }
-        }
 
         if debug {
             println!("  Objects: {}, Blobs: {}", object_count, blob_count);
