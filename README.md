@@ -12,7 +12,7 @@
 - **Visual**: Generates PNG plots of size over time (and CSV data for further analysis)
 - **Safe**: Read-only operations, never modifies your repository
 - **Cross-platform**: Works on Linux, macOS, and Windows
-- **Use Bitmap Index**: Leverages git's bitmap index for fast object counting and size estimation 
+- **Use Bitmap Index**: Leverages git's bitmap index for fast object counting and size estimation
 
 > Use ```git repack -a -d --write-bitmap-index``` to create a bitmap index for faster analysis on large repositories.
 

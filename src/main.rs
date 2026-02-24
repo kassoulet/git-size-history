@@ -192,10 +192,16 @@ fn get_commit_range<'a>(
     }
 
     analysis_pb.set_message("Counting commits...");
-    
+
     // Get total commit count using git rev-list --count (fast, especially with bitmaps)
     let count_output = Command::new("git")
-        .args(["-C", repo_path.to_str().unwrap(), "rev-list", "--count", "HEAD"])
+        .args([
+            "-C",
+            repo_path.to_str().unwrap(),
+            "rev-list",
+            "--count",
+            "HEAD",
+        ])
         .output()?;
     let total_commits = String::from_utf8_lossy(&count_output.stdout)
         .trim()
@@ -215,10 +221,16 @@ fn get_commit_range<'a>(
 
     // First commit: find all roots and pick the oldest
     let roots_output = Command::new("git")
-        .args(["-C", repo_path.to_str().unwrap(), "rev-list", "--max-parents=0", "HEAD"])
+        .args([
+            "-C",
+            repo_path.to_str().unwrap(),
+            "rev-list",
+            "--max-parents=0",
+            "HEAD",
+        ])
         .output()?;
     let stdout = String::from_utf8_lossy(&roots_output.stdout);
-    
+
     let mut first_commit: Option<git2::Commit> = None;
     let mut earliest_time = i64::MAX;
 
@@ -234,9 +246,8 @@ fn get_commit_range<'a>(
         }
     }
 
-    let first_commit = first_commit.ok_or_else(|| {
-        GitSizeError::Validation("Failed to find initial commit".to_string())
-    })?;
+    let first_commit = first_commit
+        .ok_or_else(|| GitSizeError::Validation("Failed to find initial commit".to_string()))?;
 
     Ok(CommitRange {
         first_commit,
@@ -287,7 +298,7 @@ fn generate_sample_points(
             None => break,
         };
     }
-    
+
     // Ensure the last commit's time is included as a target
     if target_times.last().map(|t| t.timestamp()) != Some(last_dt.timestamp()) {
         target_times.push(last_dt);
@@ -297,7 +308,7 @@ fn generate_sample_points(
     target_times.sort_by_key(|t| Reverse(t.timestamp()));
 
     let mut sample_points = Vec::new();
-    
+
     // Stream commits once to find all matches
     let mut child = Command::new("git")
         .args([
@@ -311,19 +322,23 @@ fn generate_sample_points(
         .spawn()
         .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
 
-    let stdout = child.stdout.take().ok_or_else(|| {
-        GitSizeError::Command("Failed to open git rev-list stdout".to_string())
-    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitSizeError::Command("Failed to open git rev-list stdout".to_string()))?;
     let reader = BufReader::new(stdout);
-    
+
     let mut target_idx = 0;
-    
+
     for line in reader.lines() {
         let line = line?;
         let mut parts = line.split_whitespace();
-        let ts = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        let ts = parts
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
         let hash = parts.next().unwrap_or("");
-        
+
         // While the current commit is at or before our current target timestamp,
         // it's the latest commit for that target.
         while target_idx < target_times.len() && ts <= target_times[target_idx].timestamp() {
@@ -335,14 +350,14 @@ fn generate_sample_points(
             }
             target_idx += 1;
         }
-        
+
         if target_idx >= target_times.len() {
             // Found all sample points, can stop early
             let _ = child.kill();
             break;
         }
     }
-    
+
     let _ = child.wait();
 
     // Sort by date ascending for the rest of the application
@@ -676,7 +691,7 @@ fn main() -> Result<()> {
     );
     analysis_pb.enable_steady_tick(std::time::Duration::from_millis(100));
     analysis_pb.set_message("Reading commit history...");
-    
+
     // Get commit range
     let range = get_commit_range(&repo, &repo_path, &analysis_pb)?;
     let total_commits = range.total_commits;
@@ -713,7 +728,9 @@ fn main() -> Result<()> {
     let pb = ProgressBar::new(samples.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+            .template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+            )
             .map_err(|e| GitSizeError::Validation(format!("Failed to set progress style: {}", e)))?
             .progress_chars("=>-"),
     );
@@ -722,7 +739,7 @@ fn main() -> Result<()> {
     // Wrap progress bar in Arc for thread-safe updates
     // indicatif::ProgressBar is already thread-safe using atomics
     let pb = std::sync::Arc::new(pb);
-    
+
     // Measure sizes in parallel for better performance
     // Using rayon to process multiple sample points concurrently
     let results: Vec<SizeMeasurement> = samples
