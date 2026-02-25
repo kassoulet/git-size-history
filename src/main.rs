@@ -421,7 +421,10 @@ fn measure_size_at_commit(
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(source_repo)
-            .args(["cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"])
+            .args([
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
