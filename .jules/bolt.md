@@ -13,3 +13,11 @@
 ## 2026-02-24 - [Streaming Process Output]
 **Learning:** `wait_with_output()` buffers the entire stdout/stderr into memory, which can cause OOM for large repositories. Using `BufReader` to stream output line-by-line is much more memory-efficient.
 **Action:** Always stream large process outputs in parallel or high-volume contexts.
+
+## 2026-02-25 - [Allocation Reuse in IO Loops]
+**Learning:** Reusing a `String` buffer with `reader.read_line(&mut line)` in history-walking or object-listing loops significantly reduces heap allocation pressure compared to `reader.lines()`.
+**Action:** Use `read_line` with buffer reuse in all performance-critical parsing loops.
+
+## 2026-02-25 - [Pre-formatting and Caching in Loops]
+**Learning:** Redundant calls to `format()` or `timestamp()` inside tight loops (like walking 1M+ commits) add measurable overhead.
+**Action:** Pre-format static data like target dates and cache timestamps outside of the loop.
