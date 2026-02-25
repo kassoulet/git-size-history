@@ -195,13 +195,12 @@ fn get_commit_range<'a>(
 
     // Get total commit count using git rev-list --count (fast, especially with bitmaps)
     let count_output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_str().unwrap(),
-            "rev-list",
-            "--count",
-            "HEAD",
-        ])
+        .arg("--no-replace-objects")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("rev-list")
+        .arg("--count")
+        .arg("HEAD")
         .output()?;
     let total_commits = String::from_utf8_lossy(&count_output.stdout)
         .trim()
@@ -221,13 +220,12 @@ fn get_commit_range<'a>(
 
     // First commit: find all roots and pick the oldest
     let roots_output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_str().unwrap(),
-            "rev-list",
-            "--max-parents=0",
-            "HEAD",
-        ])
+        .arg("--no-replace-objects")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("rev-list")
+        .arg("--max-parents=0")
+        .arg("HEAD")
         .output()?;
     let stdout = String::from_utf8_lossy(&roots_output.stdout);
 
@@ -311,13 +309,12 @@ fn generate_sample_points(
 
     // Stream commits once to find all matches
     let mut child = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_str().unwrap(),
-            "rev-list",
-            "--timestamp",
-            "HEAD",
-        ])
+        .arg("--no-replace-objects")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("rev-list")
+        .arg("--timestamp")
+        .arg("HEAD")
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
@@ -386,22 +383,16 @@ fn measure_size_at_commit(
         ));
     }
 
-    let repo_path_str = source_repo.to_str().ok_or_else(|| {
-        GitSizeError::Validation(format!("Invalid repository path: {:?}", source_repo))
-    })?;
-
     // Get packed disk usage using git rev-list --disk-usage
     let disk_usage_output = Command::new("git")
-        .args([
-            "--no-replace-objects",
-            "-C",
-            repo_path_str,
-            "rev-list",
-            "--objects",
-            "--disk-usage",
-            "--use-bitmap-index",
-            commit_hash,
-        ])
+        .arg("--no-replace-objects")
+        .arg("-C")
+        .arg(source_repo)
+        .arg("rev-list")
+        .arg("--objects")
+        .arg("--disk-usage")
+        .arg("--use-bitmap-index")
+        .arg(commit_hash)
         .output()
         .map_err(|e| GitSizeError::Command(format!("Failed to get disk usage: {}", e)))?;
 
@@ -422,26 +413,22 @@ fn measure_size_at_commit(
     // Calculate uncompressed size only if requested (it's slower)
     let uncompressed_size = if calculate_uncompressed {
         let mut rev_list = Command::new("git")
-            .args([
-                "--no-replace-objects",
-                "-C",
-                repo_path_str,
-                "rev-list",
-                "--objects",
-                commit_hash,
-            ])
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(source_repo)
+            .arg("rev-list")
+            .arg("--objects")
+            .arg(commit_hash)
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
 
         let mut cat_file = Command::new("git")
-            .args([
-                "--no-replace-objects",
-                "-C",
-                repo_path_str,
-                "cat-file",
-                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-            ])
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(source_repo)
+            .arg("cat-file")
+            .arg("--batch-check=%(objectname) %(objecttype) %(objectsize)")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
