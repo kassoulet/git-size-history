@@ -198,9 +198,7 @@ fn get_commit_range<'a>(
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo_path)
-        .arg("rev-list")
-        .arg("--count")
-        .arg("HEAD")
+        .args(["rev-list", "--count", "HEAD"])
         .output()?;
     let total_commits = String::from_utf8_lossy(&count_output.stdout)
         .trim()
@@ -223,9 +221,7 @@ fn get_commit_range<'a>(
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo_path)
-        .arg("rev-list")
-        .arg("--max-parents=0")
-        .arg("HEAD")
+        .args(["rev-list", "--max-parents=0", "HEAD"])
         .output()?;
     let stdout = String::from_utf8_lossy(&roots_output.stdout);
 
@@ -312,9 +308,7 @@ fn generate_sample_points(
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo_path)
-        .arg("rev-list")
-        .arg("--timestamp")
-        .arg("HEAD")
+        .args(["rev-list", "--timestamp", "HEAD"])
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
@@ -397,11 +391,13 @@ fn measure_size_at_commit(
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(source_repo)
-        .arg("rev-list")
-        .arg("--objects")
-        .arg("--disk-usage")
-        .arg("--use-bitmap-index")
-        .arg(commit_hash)
+        .args([
+            "rev-list",
+            "--objects",
+            "--disk-usage",
+            "--use-bitmap-index",
+            commit_hash,
+        ])
         .output()
         .map_err(|e| GitSizeError::Command(format!("Failed to get disk usage: {}", e)))?;
 
@@ -425,9 +421,7 @@ fn measure_size_at_commit(
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(source_repo)
-            .arg("rev-list")
-            .arg("--objects")
-            .arg(commit_hash)
+            .args(["rev-list", "--objects", commit_hash])
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
@@ -436,8 +430,10 @@ fn measure_size_at_commit(
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(source_repo)
-            .arg("cat-file")
-            .arg("--batch-check=%(objectname) %(objecttype) %(objectsize)")
+            .args([
+                "cat-file",
+                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
