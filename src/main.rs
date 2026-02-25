@@ -323,13 +323,21 @@ fn generate_sample_points(
         .stdout
         .take()
         .ok_or_else(|| GitSizeError::Command("Failed to open git rev-list stdout".to_string()))?;
-    let reader = BufReader::new(stdout);
+    let mut reader = BufReader::new(stdout);
 
     let mut target_idx = 0;
 
-    for line in reader.lines() {
-        let line = line?;
-        let mut parts = line.split_whitespace();
+    // Pre-format target dates and timestamps to avoid redundant work in the loop
+    let target_dates: Vec<String> = target_times
+        .iter()
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .collect();
+    let target_timestamps: Vec<i64> = target_times.iter().map(|t| t.timestamp()).collect();
+
+    let mut line = String::with_capacity(64);
+    while reader.read_line(&mut line)? > 0 {
+        // Use split_ascii_whitespace for better performance on git output
+        let mut parts = line.split_ascii_whitespace();
         let ts = parts
             .next()
             .and_then(|s| s.parse::<i64>().ok())
@@ -338,21 +346,22 @@ fn generate_sample_points(
 
         // While the current commit is at or before our current target timestamp,
         // it's the latest commit for that target.
-        while target_idx < target_times.len() && ts <= target_times[target_idx].timestamp() {
+        while target_idx < target_timestamps.len() && ts <= target_timestamps[target_idx] {
             if !hash.is_empty() {
                 sample_points.push(SamplePoint {
-                    date: target_times[target_idx].format("%Y-%m-%d").to_string(),
+                    date: target_dates[target_idx].clone(),
                     commit_hash: hash.to_string(),
                 });
             }
             target_idx += 1;
         }
 
-        if target_idx >= target_times.len() {
+        if target_idx >= target_timestamps.len() {
             // Found all sample points, can stop early
             let _ = child.kill();
             break;
         }
+        line.clear();
     }
 
     let _ = child.wait();
@@ -403,11 +412,11 @@ fn measure_size_at_commit(
     }
 
     // The last line contains the total disk usage in bytes
-    let disk_usage_stdout = String::from_utf8_lossy(&disk_usage_output.stdout);
-    let packed_size = disk_usage_stdout
-        .lines()
-        .last()
-        .and_then(|line| line.trim().parse::<u64>().ok())
+    // Optimized: avoid String allocation and correctly handle potential multi-line output
+    let packed_size = std::str::from_utf8(&disk_usage_output.stdout)
+        .ok()
+        .and_then(|s| s.trim().lines().last())
+        .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(0);
 
     // Calculate uncompressed size only if requested (it's slower)
@@ -450,11 +459,17 @@ fn measure_size_at_commit(
         // This prevents a deadlock when the pipe buffers fill up.
         let stdin_handle = std::thread::spawn(move || -> io::Result<()> {
             let mut reader = BufReader::new(rev_list_stdout);
-            let mut line = String::new();
+            let mut line = String::with_capacity(64);
 
             while reader.read_line(&mut line)? > 0 {
-                if let Some(oid) = line.split_whitespace().next() {
-                    stdin.write_all(oid.as_bytes())?;
+                // Optimized: avoid split_whitespace() for every object.
+                // git rev-list --objects output is "<hash> <path>"
+                let hash = match line.find(' ') {
+                    Some(idx) => &line[..idx],
+                    None => line.trim(),
+                };
+                if !hash.is_empty() {
+                    stdin.write_all(hash.as_bytes())?;
                     stdin.write_all(b"\n")?;
                 }
                 line.clear();
@@ -467,22 +482,23 @@ fn measure_size_at_commit(
         let mut blob_count = 0u64;
         let mut object_count = 0u64;
 
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            let line = line?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::with_capacity(128);
+        while reader.read_line(&mut line)? > 0 {
             object_count += 1;
-            let mut parts = line.split_whitespace();
+            // Optimized: use split_ascii_whitespace and reused buffer
+            // git cat-file --batch-check output is "<oid> <type> <size>"
+            let mut parts = line.split_ascii_whitespace();
             let _oid = parts.next();
-            let kind = parts.next();
-            let size = parts.next();
-            if kind == Some("blob") {
-                if let Some(s) = size {
-                    if let Ok(s_u64) = s.parse::<u64>() {
+            if let Some("blob") = parts.next() {
+                if let Some(size_str) = parts.next() {
+                    if let Ok(s_u64) = size_str.parse::<u64>() {
                         total += s_u64;
                         blob_count += 1;
                     }
                 }
             }
+            line.clear();
         }
 
         // Ensure the stdin writing thread finished successfully
