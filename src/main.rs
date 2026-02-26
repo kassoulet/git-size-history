@@ -156,11 +156,11 @@ const MONTHLY_INTERVAL_DAYS: i64 = 30;
 
 /// Check if the repository has a bitmap index available.
 ///
-/// Bitmap indexes are stored in .git/objects/pack/ directory as .bitmap files.
+/// Bitmap indexes are stored in the objects/pack/ directory as .bitmap files.
 /// They significantly speed up git rev-list --disk-usage operations.
-fn check_bitmap_index(repo_path: &Path) -> bool {
-    let pack_dir = repo_path.join(".git/objects/pack");
-    if let Ok(entries) = std::fs::read_dir(&pack_dir) {
+fn check_bitmap_index(repo: &Repository) -> bool {
+    let objects_dir = repo.path().join("objects/pack");
+    if let Ok(entries) = std::fs::read_dir(objects_dir) {
         for entry in entries.flatten() {
             if entry.path().extension().is_some_and(|ext| ext == "bitmap") {
                 return true;
@@ -181,7 +181,7 @@ fn get_commit_range<'a>(
     analysis_pb: &ProgressBar,
 ) -> Result<CommitRange<'a>> {
     // Check for bitmap index and warn if not present
-    let has_bitmap = check_bitmap_index(repo_path);
+    let has_bitmap = check_bitmap_index(repo);
     if !has_bitmap {
         eprintln!(
             "⚠️  Warning: No bitmap index found in repository.\n\
