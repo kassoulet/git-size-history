@@ -194,11 +194,12 @@ fn get_commit_range<'a>(
     analysis_pb.set_message("Counting commits...");
 
     // Get total commit count using git rev-list --count (fast, especially with bitmaps)
+    // SECURITY: Use "--" to separate revisions from paths to prevent argument injection.
     let count_output = Command::new("git")
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo_path)
-        .args(["rev-list", "--count", "HEAD"])
+        .args(["rev-list", "--count", "HEAD", "--"])
         .output()?;
     let total_commits = String::from_utf8_lossy(&count_output.stdout)
         .trim()
@@ -217,18 +218,27 @@ fn get_commit_range<'a>(
     let last_commit = repo.head()?.peel_to_commit()?;
 
     // First commit: find all roots and pick the oldest
-    let roots_output = Command::new("git")
+    // SECURITY: Use streaming output (BufReader) to prevent OOM DoS if there are many root commits.
+    // SECURITY: Use "--" to separate revisions from paths to prevent argument injection.
+    let mut roots_child = Command::new("git")
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo_path)
-        .args(["rev-list", "--max-parents=0", "HEAD"])
-        .output()?;
-    let stdout = String::from_utf8_lossy(&roots_output.stdout);
+        .args(["rev-list", "--max-parents=0", "HEAD", "--"])
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let roots_stdout = roots_child
+        .stdout
+        .take()
+        .ok_or_else(|| GitSizeError::Command("Failed to open git rev-list stdout".to_string()))?;
 
     let mut first_commit: Option<git2::Commit> = None;
     let mut earliest_time = i64::MAX;
 
-    for line in stdout.lines() {
+    let mut reader = BufReader::new(roots_stdout);
+    let mut line = String::with_capacity(64);
+    while reader.read_line(&mut line)? > 0 {
         if let Ok(oid) = git2::Oid::from_str(line.trim()) {
             if let Ok(commit) = repo.find_commit(oid) {
                 let time = commit.time().seconds();
@@ -238,7 +248,9 @@ fn get_commit_range<'a>(
                 }
             }
         }
+        line.clear();
     }
+    let _ = roots_child.wait();
 
     let first_commit = first_commit
         .ok_or_else(|| GitSizeError::Validation("Failed to find initial commit".to_string()))?;
@@ -304,11 +316,12 @@ fn generate_sample_points(
     let mut sample_points = Vec::new();
 
     // Stream commits once to find all matches
+    // SECURITY: Use "--" to separate revisions from paths to prevent argument injection.
     let mut child = Command::new("git")
         .arg("--no-replace-objects")
         .arg("-C")
         .arg(repo_path)
-        .args(["rev-list", "--timestamp", "HEAD"])
+        .args(["rev-list", "--timestamp", "HEAD", "--"])
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
@@ -387,6 +400,7 @@ fn measure_size_at_commit(
     }
 
     // Get packed disk usage using git rev-list --disk-usage
+    // SECURITY: Use "--" to separate revisions from paths to prevent argument injection.
     let disk_usage_output = Command::new("git")
         .arg("--no-replace-objects")
         .arg("-C")
@@ -397,6 +411,7 @@ fn measure_size_at_commit(
             "--disk-usage",
             "--use-bitmap-index",
             commit_hash,
+            "--",
         ])
         .output()
         .map_err(|e| GitSizeError::Command(format!("Failed to get disk usage: {}", e)))?;
@@ -417,11 +432,12 @@ fn measure_size_at_commit(
 
     // Calculate uncompressed size only if requested (it's slower)
     let uncompressed_size = if calculate_uncompressed {
+        // SECURITY: Use "--" to separate revisions from paths to prevent argument injection.
         let mut rev_list = Command::new("git")
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(source_repo)
-            .args(["rev-list", "--objects", commit_hash])
+            .args(["rev-list", "--objects", commit_hash, "--"])
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;

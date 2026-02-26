@@ -12,3 +12,13 @@
 **Vulnerability:** Potential deception by Git's object replacement mechanism and panics on non-UTF-8 repository paths.
 **Learning:** Git analysis tools should use `--no-replace-objects` to ensure they analyze the raw repository state. Relying on `.to_str().unwrap()` for paths in `std::process::Command` is a common source of panics and limits support to UTF-8 paths.
 **Prevention:** Always include `--no-replace-objects` in git calls for security audits. Use `AsRef<OsStr>` (via direct `Path` passing) in `Command::arg` to handle all valid OS paths safely.
+
+## 2026-02-26 - OOM DoS in Root Commit Collection
+**Vulnerability:** Potential OOM Denial of Service when collecting root commits using `Command::output()`.
+**Learning:** Although most repositories have few root commits, collecting all output from `git rev-list --max-parents=0` into memory can lead to OOM if a malicious repository contains millions of root commits.
+**Prevention:** Always stream the output of `git rev-list` using `BufReader` and a reused `String` buffer, even for commands expected to have small output.
+
+## 2026-02-26 - Argument Injection in Git Revision Handling
+**Vulnerability:** Potential argument injection when passing revisions or hashes to `git rev-list`.
+**Learning:** Failing to use the `--` separator between revisions and pathspecs allows malicious or malformed hashes to be interpreted as command-line options.
+**Prevention:** Always include the `--` separator in `git rev-list` and similar commands to clearly disambiguate revisions from paths, e.g., `git rev-list <rev> --`.
