@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::error::Error;
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -432,63 +432,43 @@ fn measure_size_at_commit(
 
     // Calculate uncompressed size only if requested (it's slower)
     let uncompressed_size = if calculate_uncompressed {
+        // Optimized: use --filter=object:type=blob to skip trees, and --no-object-names to reduce output.
+        // Also use OS-level piping between processes to avoid the overhead of a manual Rust pipe thread.
         // SECURITY: Use "--" to separate revisions from paths to prevent argument injection.
         let mut rev_list = Command::new("git")
             .arg("--no-replace-objects")
             .arg("-C")
             .arg(source_repo)
-            .args(["rev-list", "--objects", commit_hash, "--"])
+            .args([
+                "rev-list",
+                "--objects",
+                "--filter=object:type=blob",
+                "--no-object-names",
+                "--use-bitmap-index",
+                commit_hash,
+                "--",
+            ])
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|e| GitSizeError::Command(format!("Failed to spawn git rev-list: {}", e)))?;
-
-        let mut cat_file = Command::new("git")
-            .arg("--no-replace-objects")
-            .arg("-C")
-            .arg(source_repo)
-            .args([
-                "cat-file",
-                "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|e| GitSizeError::Command(format!("Failed to spawn git cat-file: {}", e)))?;
-
-        let mut stdin = cat_file.stdin.take().ok_or_else(|| {
-            GitSizeError::Command("Failed to open git cat-file stdin".to_string())
-        })?;
 
         let rev_list_stdout = rev_list.stdout.take().ok_or_else(|| {
             GitSizeError::Command("Failed to open git rev-list stdout".to_string())
         })?;
 
+        let mut cat_file = Command::new("git")
+            .arg("--no-replace-objects")
+            .arg("-C")
+            .arg(source_repo)
+            .args(["cat-file", "--batch-check=%(objecttype) %(objectsize)"])
+            .stdin(Stdio::from(rev_list_stdout))
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|e| GitSizeError::Command(format!("Failed to spawn git cat-file: {}", e)))?;
+
         let stdout = cat_file.stdout.take().ok_or_else(|| {
             GitSizeError::Command("Failed to open git cat-file stdout".to_string())
         })?;
-
-        // Use a separate thread to write to cat-file's stdin while reading its stdout.
-        // This prevents a deadlock when the pipe buffers fill up.
-        let stdin_handle = std::thread::spawn(move || -> io::Result<()> {
-            let mut reader = BufReader::new(rev_list_stdout);
-            let mut line = String::with_capacity(64);
-
-            while reader.read_line(&mut line)? > 0 {
-                // Optimized: avoid split_whitespace() for every object.
-                // git rev-list --objects output is "<hash> <path>"
-                let hash = match line.find(' ') {
-                    Some(idx) => &line[..idx],
-                    None => line.trim(),
-                };
-                if !hash.is_empty() {
-                    stdin.write_all(hash.as_bytes())?;
-                    stdin.write_all(b"\n")?;
-                }
-                line.clear();
-            }
-            drop(stdin); // Close stdin to signal end of input
-            Ok(())
-        });
 
         let mut total = 0u64;
         let mut blob_count = 0u64;
@@ -499,9 +479,8 @@ fn measure_size_at_commit(
         while reader.read_line(&mut line)? > 0 {
             object_count += 1;
             // Optimized: use split_ascii_whitespace and reused buffer
-            // git cat-file --batch-check output is "<oid> <type> <size>"
+            // git cat-file --batch-check output is "<type> <size>"
             let mut parts = line.split_ascii_whitespace();
-            let _oid = parts.next();
             if let Some("blob") = parts.next() {
                 if let Some(size_str) = parts.next() {
                     if let Ok(s_u64) = size_str.parse::<u64>() {
@@ -512,12 +491,6 @@ fn measure_size_at_commit(
             }
             line.clear();
         }
-
-        // Ensure the stdin writing thread finished successfully
-        stdin_handle
-            .join()
-            .map_err(|_| GitSizeError::Command("Stdin thread panicked".to_string()))?
-            .map_err(|e| GitSizeError::Command(format!("Failed writing to stdin: {}", e)))?;
 
         // Clean up processes
         cat_file.wait().map_err(|e| {
